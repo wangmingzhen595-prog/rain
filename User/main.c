@@ -172,8 +172,7 @@ int main(void)
 	OLED_ShowString(1, 11, "G:");        // 当前增益标记
 	OLED_ShowString(2, 1, "Volt:");      // 合并通道峰值电压
 	OLED_ShowString(3, 1, "Rain:");      // 累计雨量
-	OLED_ShowString(4, 1, "     ");      // 保留空行
-	OLED_ShowString(4, 9, "     ");
+	OLED_ShowString(4, 1, "Sum:");       // 累计电压标签
     
     // ========== 主循环 ==========
     while (1)                            // 程序主要逻辑
@@ -356,13 +355,24 @@ void Update_Display(void)
 		OLED_ShowNum(2, 10, v100 % 10, 1);  // 显示百分位
 	}
 
-	/* 行3：累计降雨 mm，保留1位小数 */
+	/* 行3：实时雨量（降雨强度 mm/h），保留2位小数 */
 	{
-		uint16_t s = (uint16_t)(total_rain_mm * 10.0f); // 降雨量乘以10转换为整数
-		OLED_ShowNum(3, 7, s / 10, 3);   // 显示整数部分
-		OLED_ShowChar(3, 10, '.');       // 显示小数点
-		OLED_ShowNum(3, 11, s % 10, 1);  // 显示小数部分
-		OLED_ShowString(3, 12, "mm");    // 显示单位
+		uint16_t intensity100 = (uint16_t)(current_intensity_mmh * 100.0f); // 降雨强度乘以100转换为整数
+		OLED_ShowNum(3, 7, intensity100 / 100, 3); // 显示整数部分（最多3位）
+		OLED_ShowChar(3, 10, '.');          // 显示小数点
+		OLED_ShowNum(3, 11, (intensity100 % 100) / 10, 1); // 显示十分位
+		OLED_ShowNum(3, 12, intensity100 % 10, 1);  // 显示百分位
+		OLED_ShowString(3, 14, "mm/h");    // 显示单位
+	}
+
+	/* 行4：累计电压总和（V），保留2位小数 */
+	{
+		uint16_t sum100 = (uint16_t)(voltage_sum * 100.0f); // 累计电压值乘以100转换为整数
+		OLED_ShowNum(4, 6, sum100 / 100, 3); // 显示整数部分（最多3位）
+		OLED_ShowChar(4, 9, '.');          // 显示小数点
+		OLED_ShowNum(4, 10, (sum100 % 100) / 10, 1); // 显示十分位
+		OLED_ShowNum(4, 11, sum100 % 10, 1);  // 显示百分位
+		OLED_ShowString(4, 13, "V");       // 显示单位
 	}
 
 }
