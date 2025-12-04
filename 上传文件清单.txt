@@ -1,0 +1,88 @@
+========================================
+GitHub上传文件清单
+========================================
+
+【必须上传的核心文件】
+
+1. User目录（4个文件）：
+   ✓ User/main.c
+   ✓ User/stm32f10x_it.c
+   ✓ User/stm32f10x_it.h
+   ✓ User/stm32f10x_conf.h
+
+2. Hardware目录（9个文件）：
+   ✓ Hardware/AD.c
+   ✓ Hardware/AD.h
+   ✓ Hardware/OLED.c
+   ✓ Hardware/OLED.h
+   ✓ Hardware/OLED_Font.h
+   ✓ Hardware/Key.c
+   ✓ Hardware/Key.h
+   ✓ Hardware/LED.c
+   ✓ Hardware/LED.h
+
+3. System目录（2个文件）：
+   ✓ System/Delay.c
+   ✓ System/Delay.h
+
+4. Start目录（5个文件）：
+   ✓ Start/core_cm3.c
+   ✓ Start/core_cm3.h
+   ✓ Start/system_stm32f10x.c
+   ✓ Start/system_stm32f10x.h
+   ✓ Start/stm32f10x.h
+   ✓ Start/startup_stm32f10x_md.s（根据芯片选择）
+
+5. Library目录（只上传实际使用的，建议上传这些）：
+   ✓ Library/stm32f10x_adc.c
+   ✓ Library/stm32f10x_adc.h
+   ✓ Library/stm32f10x_dma.c
+   ✓ Library/stm32f10x_dma.h
+   ✓ Library/stm32f10x_gpio.c
+   ✓ Library/stm32f10x_gpio.h
+   ✓ Library/stm32f10x_rcc.c
+   ✓ Library/stm32f10x_rcc.h
+   ✓ Library/stm32f10x_usart.c
+   ✓ Library/stm32f10x_usart.h
+   ✓ Library/misc.c
+   ✓ Library/misc.h
+
+6. 项目配置文件：
+   ✓ Project.uvprojx
+   ✓ README.md
+   ✓ .gitignore
+
+【不需要上传的文件】
+   ✗ Objects/ 目录（编译产物）
+   ✗ Listings/ 目录（编译产物）
+   ✗ DebugConfig/ 目录
+   ✗ *.uvguix* 文件
+   ✗ *.uvoptx 文件
+   ✗ *.bak 文件
+   ✗ *.o, *.d, *.crf 等编译文件
+
+========================================
+快速上传步骤
+========================================
+
+方法1：网页直接上传（最简单）
+----------------------------------------
+1. 访问：https://github.com/wangmingzhen595-prog/-
+2. 点击 "uploading an existing file" 或 "Add file" -> "Upload files"
+3. 拖拽上述文件到页面（可以一次选择多个文件）
+4. 在底部输入提交信息：
+   初始提交：STM32雨滴传感器检测系统，已修复电压显示跳变问题
+5. 点击 "Commit changes" 完成
+
+方法2：使用GitHub Desktop（推荐）
+----------------------------------------
+1. 下载：https://desktop.github.com/
+2. 安装后打开，登录GitHub账号
+3. File -> Add Local Repository -> 选择项目目录
+4. 如果提示不是git仓库，勾选 "Create a repository"
+5. 点击 "Commit to main"
+6. 点击 "Publish repository" -> 选择远程仓库
+7. 完成上传
+
+========================================
+
