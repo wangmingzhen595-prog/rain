@@ -43,7 +43,7 @@
 /* 后部噪声过滤参数：避免后部噪声误判为新峰值 */
 #define IDLE_TRIGGER_MARGIN     100      // IDLE状态触发阈值余量（ADC单位），避免后部小波动触发
 #define IDLE_TRIGGER_CONSEC     3        // IDLE状态需要连续N个样本都超过阈值才触发
-#define STABLE_PERIOD_COUNT     20       // 稳定期样本数，WAIT_FALL完成后需要值在基线附近保持的样本数
+#define STABLE_PERIOD_COUNT     100      // 稳定期样本数，WAIT_FALL完成后需要值在基线附近保持的样本数（约4.2ms，确保后部震荡完全结束）
 #define STABLE_BASELINE_DELTA   50       // 稳定期基线附近的范围（ADC单位）
 #define DEAD_TIME_SCALE_FACTOR  2        // 死区时间缩放因子，根据峰值大小动态调整
 #define DEAD_TIME_MIN           50       // 最小死区时间
@@ -309,6 +309,7 @@ static void Process_ADC_Sample(uint8_t channel, uint16_t value, uint16_t ring_in
 
         case PEAK_STATE_SEARCHING:
             /* 前部峰值检测：只在前部（上升→峰值→下降到0）搜索峰值，忽略后部 */
+            /* 关键：限制搜索时间窗口，确保只捕获前部峰值，不捕获后部震荡 */
             
             /* 检查是否已回落到基线附近（前部结束标志） */
             if (value <= (ctx->baseline_value + PEAK_LOCK_BASELINE_DELTA))
@@ -352,9 +353,10 @@ static void Process_ADC_Sample(uint8_t channel, uint16_t value, uint16_t ring_in
             ctx->prev_value = value;  // 更新上一次的值
             ctx->search_count++;
             
-            /* 如果搜索窗口用完，进入WAIT_FALL状态 */
+            /* 如果搜索窗口用完，强制锁定峰值并进入WAIT_FALL状态（防止搜索时间过长捕获后部震荡） */
             if (ctx->search_count >= PEAK_WINDOW_SIZE)
             {
+                ctx->peak_locked = 1;  // 强制锁定峰值
                 ctx->peak_state = PEAK_STATE_WAIT_FALL;
             }
             break;
@@ -363,7 +365,8 @@ static void Process_ADC_Sample(uint8_t channel, uint16_t value, uint16_t ring_in
             if (value < (ctx->baseline_value + RETURN_THRESHOLD))
             {
                 /* 脉冲完成：记录本次完整脉冲的峰值（仅通道0/PA0），供主循环显示使用 */
-                if (channel == 0)
+                /* 验证峰值是否明显大于基线，过滤后部噪声（后部噪声通常不会明显大于基线） */
+                if (channel == 0 && ctx->local_max > (ctx->baseline_value + 500))
                 {
                     last_peak_value_from_isr = ctx->local_max;
                     last_peak_index_from_isr = ctx->local_max_index;

@@ -58,8 +58,12 @@
 #define FRONT_END_DELTA         MIN_LOCAL_DELTA   // 认为“回到基线”的门限
 #define FRONT_END_SETTLE_COUNT  TAIL_SETTLE_COUNT// 回落连续样本计数
 
+/* 严格前部处理：每个脉冲信号只取前部（约2ms），后部数据完全不分析，避免后部抖动导致跳变 */
+#define FRONT_ANALYSIS_TIME_MS  2.0f              // 前部分析时间窗口（毫秒）
+#define FRONT_ANALYSIS_SAMPLES   ((uint16_t)(FRONT_ANALYSIS_TIME_MS * 1000.0f / ADC_SAMPLE_INTERVAL_US))  // 前部分析采样点数（约48点）
+
 /* 事件级死区：用于在快照层面避免同一滴的重复触发（单位：主循环次数，10ms/次） */
-#define EVENT_DEADTIME_LOOPS    30       // 约 300ms，可按需要标定
+#define EVENT_DEADTIME_LOOPS    50       // 约 500ms，可按需要标定，避免同一滴的拖尾触发新的快照
 
 /* 雨量学参数（需根据传感器标定修正） */
 #define MM_PER_DROP             0.02f    // 每个有效雨滴折合降雨量（mm/滴）——占位标定值
@@ -77,8 +81,20 @@ float voltage_sum = 0.0;                 // 累积电压总和(单位:伏特V)
 /* 峰值保持机制：避免小噪声覆盖大峰值 */
 static uint16_t last_valid_peak = 0;    // 上一次有效的峰值（用于峰值保持）
 static uint32_t peak_hold_counter = 0;   // 峰值保持计数器
-#define PEAK_HOLD_TIME_MS    500         // 峰值保持时间（毫秒），500ms内只显示更大的峰值
+#define PEAK_HOLD_TIME_MS    200         // 峰值保持时间（毫秒），200ms内只显示更大的峰值，确保快速连续雨滴仍能检测
 #define PEAK_HOLD_MIN_DELTA  200         // 新峰值必须比旧峰值大至少200个ADC单位才更新（约160mV）
+#define PEAK_HOLD_MIN_RATIO  0.7f        // 新峰值必须大于旧峰值的70%才更新（仅在保持时间内生效，防止后部震荡误判）
+
+/* 快速跳变过滤机制：过滤快速跳变（正常值→小值，一直显示小值），同时保留真实小雨滴 */
+static uint16_t suspicious_peak = 0;              // 可疑峰值（明显小于旧峰值的新峰值）
+static uint32_t suspicious_peak_counter = 0;      // 可疑峰值延迟计数器
+#define RAPID_JUMP_FILTER_TIME_MS  50            // 快速跳变过滤时间（毫秒），如果小值在50ms内被更大的值覆盖，说明是跳变
+#define RAPID_JUMP_RATIO  0.5f                    // 明显小于旧峰值的阈值（50%），小于此值认为是可疑峰值
+
+/* 快速跳变时间过滤：如果新峰值明显小于旧峰值，且距离上次更新时间很短，直接忽略 */
+static uint32_t last_update_counter = 0;          // 最近一次峰值更新的主循环计数
+static uint32_t main_loop_counter = 0;            // 主循环计数器（每10ms递增）
+#define RAPID_JUMP_TIME_THRESHOLD  3              // 快速跳变时间阈值（主循环次数，即30ms），30ms内的小峰值直接忽略
 
 /* 中断层在线峰值检测结果（仅PA0）：每次完整脉冲结束时更新 */
 volatile uint16_t last_peak_value_from_isr = 0;   // 最近一次完整脉冲的峰值ADC码
@@ -162,7 +178,10 @@ int main(void)
     // ========== 主循环 ==========
     while (1)                            // 程序主要逻辑
     {
-		/* 中断层在线峰值：每次完整脉冲结束时，由 Process_ADC_Sample 写入 */
+		main_loop_counter++;             // 主循环计数器递增（每10ms递增一次）
+		/* 中断层在线峰值：作为备用路径，确保即使快照处理失败也能更新显示 */
+		/* 注意：中断层已添加验证（明显大于基线），但仍可能捕获后部噪声 */
+		/* 优先使用快照处理的结果（严格前部窗口），中断层作为备用 */
 		if (last_peak_ready_from_isr)
 		{
 			/* 在线状态机给出的完整脉冲峰值（PA0） */
@@ -173,6 +192,7 @@ int main(void)
 			if (peak_candidate >= DISPLAY_MIN_AMPLITUDE)
 			{
 				/* 峰值保持机制：在保持时间内，只有更大的峰值才能更新显示 */
+				/* 关键改进：仅在保持时间内忽略明显小于旧峰值的新峰值（小于70%），防止后部震荡误判 */
 				uint8_t should_update = 0;
 				
 				if (last_valid_peak == 0)
@@ -181,19 +201,54 @@ int main(void)
 					should_update = 1;
 					peak_hold_counter = PEAK_HOLD_TIME_MS / 10;  // 转换为10ms单位
 				}
-				else if (peak_candidate > (last_valid_peak + PEAK_HOLD_MIN_DELTA))
+				else if (peak_hold_counter > 0)
 				{
-					/* 新峰值明显大于旧峰值，更新 */
-					should_update = 1;
-					peak_hold_counter = PEAK_HOLD_TIME_MS / 10;
+					/* 保持时间内：检查新峰值是否明显大于旧峰值 */
+					if (peak_candidate > (last_valid_peak + PEAK_HOLD_MIN_DELTA))
+					{
+						/* 新峰值明显大于旧峰值，更新 */
+						should_update = 1;
+						peak_hold_counter = PEAK_HOLD_TIME_MS / 10;
+					}
+					else if (peak_candidate >= (uint16_t)(last_valid_peak * PEAK_HOLD_MIN_RATIO))
+					{
+						/* 新峰值大于旧峰值的70%，允许更新（支持快速连续大雨滴） */
+						should_update = 1;
+						peak_hold_counter = PEAK_HOLD_TIME_MS / 10;
+					}
+					/* 否则（新峰值小于旧峰值的70%），直接忽略，防止后部震荡误判 */
 				}
-				else if (peak_hold_counter == 0)
+				else
 				{
-					/* 保持时间已过，允许更新 */
-					should_update = 1;
-					peak_hold_counter = PEAK_HOLD_TIME_MS / 10;
+					/* 保持时间已过，检查是否是可疑峰值（明显小于旧峰值） */
+					if (peak_candidate < (uint16_t)(last_valid_peak * RAPID_JUMP_RATIO))
+					{
+						/* 新峰值明显小于旧峰值（小于50%），检查距离上次更新时间 */
+						uint32_t time_since_last_update = main_loop_counter - last_update_counter;
+						
+						if (time_since_last_update <= RAPID_JUMP_TIME_THRESHOLD)
+						{
+							/* 距离上次更新时间很短（30ms内），很可能是快速跳变（后部震荡），直接忽略，不进行延迟验证 */
+							/* 不更新，不设置可疑峰值 */
+						}
+						else
+						{
+							/* 距离上次更新时间较长（超过30ms），可能是真实小雨滴，进行延迟验证 */
+							suspicious_peak = peak_candidate;
+							suspicious_peak_counter = RAPID_JUMP_FILTER_TIME_MS / 10;  // 转换为10ms单位
+							/* 不立即更新，等待延迟验证 */
+						}
+					}
+					else
+					{
+						/* 新峰值不是明显小于旧峰值，直接更新（包括正常的小雨滴） */
+						should_update = 1;
+						peak_hold_counter = PEAK_HOLD_TIME_MS / 10;
+						/* 如果有可疑峰值，清除它（因为出现了更大的峰值，说明之前的是跳变） */
+						suspicious_peak = 0;
+						suspicious_peak_counter = 0;
+					}
 				}
-				/* 否则保持旧峰值，不更新 */
 				
 				if (should_update)
 				{
@@ -203,6 +258,10 @@ int main(void)
 					voltage_sum += current_voltage;
 					last_gain_used = 'H';    // 当前仅高增益通道
 					last_valid_peak = peak_candidate;  // 更新保持的峰值
+					last_update_counter = main_loop_counter;  // 更新最近一次峰值更新的主循环计数
+					/* 如果有可疑峰值，清除它（因为出现了更大的峰值，说明之前的是跳变） */
+					suspicious_peak = 0;
+					suspicious_peak_counter = 0;
 				}
 			}
 			/* 若未达到显示门限，则认为是噪声/微小波动，不刷新显示 */
@@ -212,6 +271,25 @@ int main(void)
 		if (peak_hold_counter > 0)
 		{
 			peak_hold_counter--;
+		}
+		
+		/* 处理可疑峰值延迟验证：如果延迟时间到，且没有更大的峰值出现，说明是真实小雨滴，更新显示 */
+		if (suspicious_peak_counter > 0)
+		{
+			suspicious_peak_counter--;
+			if (suspicious_peak_counter == 0 && suspicious_peak > 0)
+			{
+				/* 延迟时间到，没有更大的峰值出现，说明是真实小雨滴，更新显示 */
+				current_peak_raw = suspicious_peak;
+				current_peak = suspicious_peak;
+				current_voltage = (float)current_peak / ADC_FULL_SCALE * ADC_REF_VOLTAGE;
+				voltage_sum += current_voltage;
+				last_gain_used = 'H';
+				last_valid_peak = suspicious_peak;
+				last_update_counter = main_loop_counter;  // 更新最近一次峰值更新的主循环计数
+				peak_hold_counter = PEAK_HOLD_TIME_MS / 10;
+				suspicious_peak = 0;  // 清除可疑峰值
+			}
 		}
 
 		/* 处理快照数据（如果就绪）：用于精确的事件验证和计数 */
@@ -327,8 +405,8 @@ void Check_System_Status(void)
  *         
  *         预触发处理时间计算（基于ADC_SAMPLE_INTERVAL_US = 42us）：
  *         - 预触发200点：200 × 42us = 8.4ms（从环形缓冲复制历史数据）
- *         - 后触发800点：800 × 42us = 33.6ms（继续采集实时数据）
- *         - 总快照窗口：1000 × 42us = 42ms
+ *         - 后触发1300点：1300 × 42us = 54.6ms（继续采集实时数据）
+ *         - 总快照窗口：1500 × 42us = 63ms（确保整个脉冲包括后部震荡都在快照内）
  *         - 触发点位置：索引200（峰值应位于此位置附近）
  *         
  *         注意：模拟看门狗触发后，DMA中断会在下一个样本处理时响应，延迟约1个采样周期（42us）
@@ -352,10 +430,20 @@ static void Process_Snapshot_IfReady(void)
 
 	int32_t baseline_high = Compute_Baseline((uint16_t *)snapshot_buffer_high, len);
 
+	/* 严格前部处理：初始峰值搜索允许在预触发区域和前部窗口内搜索，但不搜索后部数据 */
+	/* 定义前部分析窗口：触发点后的前2ms（约48个采样点），完全忽略后部数据 */
+	uint16_t front_window_start = PEAK_SEARCH_CENTER;  // 触发点索引（200）
+	uint16_t front_window_end = PEAK_SEARCH_CENTER + FRONT_ANALYSIS_SAMPLES;  // 触发点后2ms（248）
+	if (front_window_end > len)
+	{
+		front_window_end = len - 1;
+	}
+
+	/* 峰值搜索窗口：允许在预触发区域（触发点前80点）和前部窗口内搜索，确保能找到峰值 */
+	/* 但分析时只使用前部窗口的数据，不分析后部数据 */
 	uint16_t search_start = (PEAK_SEARCH_CENTER > PEAK_SEARCH_HALFSPAN) ?
-		(PEAK_SEARCH_CENTER - PEAK_SEARCH_HALFSPAN) : 0;
-	uint16_t search_end = (PEAK_SEARCH_CENTER + PEAK_SEARCH_HALFSPAN < len) ?
-		(PEAK_SEARCH_CENTER + PEAK_SEARCH_HALFSPAN) : (len - 1);
+		(PEAK_SEARCH_CENTER - PEAK_SEARCH_HALFSPAN) : 0;  // 允许搜索预触发区域
+	uint16_t search_end = front_window_end - 1;  // 限制在前部窗口结束位置，不搜索后部
 
 	Find_Peak_In_Buffer((uint16_t *)snapshot_buffer_high, len, baseline_high,
 	                    &high_peak_idx, &high_peak_val, search_start, search_end);
@@ -369,32 +457,39 @@ static void Process_Snapshot_IfReady(void)
 	/* 当前仅使用PA0单通道，增益固定为高增益 */
 	last_gain_used = 'H';
 
-	/* 仅分析前部：从“离开基线”到“回落到基线”的正向半周期，忽略之后的负向振荡 */
-	uint16_t start_index = 0;    // front_start
-	while (start_index < len && active_buffer[start_index] <= (active_baseline + FRONT_START_DELTA))
+	/* 严格前部处理：只分析前部窗口内的数据（触发点后2ms），完全忽略后部数据 */
+	/* 注意：front_window_start和front_window_end已在上面定义 */
+	uint16_t start_index = front_window_start;    // front_start，从触发点开始
+	while (start_index < front_window_end && active_buffer[start_index] <= (active_baseline + FRONT_START_DELTA))
 	{
 		start_index++;
 	}
 	if (start_index > active_peak_index)
 	{
-		start_index = (active_peak_index > SHAPE_WINDOW_PRE) ? (active_peak_index - SHAPE_WINDOW_PRE) : 0;
+		start_index = (active_peak_index > SHAPE_WINDOW_PRE) ? (active_peak_index - SHAPE_WINDOW_PRE) : front_window_start;
+	}
+	if (start_index < front_window_start)
+	{
+		start_index = front_window_start;
 	}
 
 	uint16_t end_index = active_peak_index;   // front_end 初始从峰值开始向后搜索
-	while (end_index < len && active_buffer[end_index] > (active_baseline + FRONT_END_DELTA))
+	while (end_index < front_window_end && active_buffer[end_index] > (active_baseline + FRONT_END_DELTA))
 	{
 		end_index++;
 	}
-	if (end_index == len)
+	/* 限制end_index不超过前部窗口结束位置 */
+	if (end_index >= front_window_end)
 	{
-		end_index = len - 1;
+		end_index = front_window_end - 1;
 	}
 
 	/* 进一步确认回落点：需连续 TAIL_SETTLE_COUNT 个样本低于基线+delta */
+	/* 但限制在前部窗口内搜索，不搜索后部数据 */
 	uint16_t settle_idx = active_peak_index + 1;
 	uint8_t settle_count = 0;
 	uint16_t trimmed_end = end_index;
-	while (settle_idx <= end_index)
+	while (settle_idx <= end_index && settle_idx < front_window_end)
 	{
 		if (active_buffer[settle_idx] <= (active_baseline + FRONT_END_DELTA))
 		{
@@ -414,12 +509,35 @@ static void Process_Snapshot_IfReady(void)
 	end_index = trimmed_end;
 	if (end_index <= active_peak_index)
 		end_index = (active_peak_index < len - 1) ? (active_peak_index + 1) : active_peak_index;
+	/* 确保end_index不超过前部窗口结束位置 */
+	if (end_index >= front_window_end)
+	{
+		end_index = front_window_end - 1;
+	}
 
 	/* 在前部区间 [start_index, end_index] 内重新搜索峰值，保证峰值仅来自前部 */
+	/* 如果初始搜索找到的峰值不在前部窗口内，在前部窗口内重新搜索 */
 	uint16_t front_peak_index = active_peak_index;
 	uint16_t front_peak_value = active_peak_value;
-	if (end_index >= start_index)
+	
+	/* 验证峰值是否在前部窗口内 */
+	if (active_peak_index < front_window_start || active_peak_index >= front_window_end)
 	{
+		/* 峰值不在前部窗口内（可能在预触发区域），在前部窗口内重新搜索峰值 */
+		front_peak_index = front_window_start;
+		front_peak_value = active_buffer[front_window_start];
+		for (uint16_t i = front_window_start + 1; i < front_window_end; i++)
+		{
+			if (active_buffer[i] > front_peak_value)
+			{
+				front_peak_value = active_buffer[i];
+				front_peak_index = i;
+			}
+		}
+	}
+	else if (end_index >= start_index)
+	{
+		/* 峰值在前部窗口内，在前部区间内重新搜索峰值 */
 		front_peak_index = start_index;
 		front_peak_value = active_buffer[start_index];
 		for (uint16_t i = start_index + 1; i <= end_index; i++)
@@ -437,14 +555,82 @@ static void Process_Snapshot_IfReady(void)
 
 	if (Validate_And_Count_Event(active_buffer, end_index + 1, front_peak_index, front_peak_value, threshold, start_index, end_index))
 	{
-		/* 记录本次事件的原始峰值（仅来源于前部区间，单通道PA0） */
-		current_peak_raw = front_peak_value;             // 实际采样通道的原始峰值
+		/* 峰值保持机制：在保持时间内，只有更大的峰值才能更新显示 */
+		/* 关键改进：仅在保持时间内忽略明显小于旧峰值的新峰值（小于70%），防止后部震荡误判 */
+		uint8_t should_update = 0;
+		
+		if (last_valid_peak == 0)
+		{
+			/* 第一次有效峰值，直接更新 */
+			should_update = 1;
+			peak_hold_counter = PEAK_HOLD_TIME_MS / 10;  // 转换为10ms单位
+		}
+		else if (peak_hold_counter > 0)
+		{
+			/* 保持时间内：检查新峰值是否明显大于旧峰值 */
+			if (front_peak_value > (last_valid_peak + PEAK_HOLD_MIN_DELTA))
+			{
+				/* 新峰值明显大于旧峰值，更新 */
+				should_update = 1;
+				peak_hold_counter = PEAK_HOLD_TIME_MS / 10;
+			}
+			else if (front_peak_value >= (uint16_t)(last_valid_peak * PEAK_HOLD_MIN_RATIO))
+			{
+				/* 新峰值大于旧峰值的70%，允许更新（支持快速连续大雨滴） */
+				should_update = 1;
+				peak_hold_counter = PEAK_HOLD_TIME_MS / 10;
+			}
+			/* 否则（新峰值小于旧峰值的70%），直接忽略，防止后部震荡误判 */
+		}
+		else
+		{
+			/* 保持时间已过，检查是否是可疑峰值（明显小于旧峰值） */
+			if (front_peak_value < (uint16_t)(last_valid_peak * RAPID_JUMP_RATIO))
+			{
+				/* 新峰值明显小于旧峰值（小于50%），检查距离上次更新时间 */
+				uint32_t time_since_last_update = main_loop_counter - last_update_counter;
+				
+				if (time_since_last_update <= RAPID_JUMP_TIME_THRESHOLD)
+				{
+					/* 距离上次更新时间很短（30ms内），很可能是快速跳变（后部震荡），直接忽略，不进行延迟验证 */
+					/* 不更新，不设置可疑峰值 */
+				}
+				else
+				{
+					/* 距离上次更新时间较长（超过30ms），可能是真实小雨滴，进行延迟验证 */
+					suspicious_peak = front_peak_value;
+					suspicious_peak_counter = RAPID_JUMP_FILTER_TIME_MS / 10;  // 转换为10ms单位
+					/* 不立即更新，等待延迟验证 */
+				}
+			}
+			else
+			{
+				/* 新峰值不是明显小于旧峰值，直接更新（包括正常的小雨滴） */
+				should_update = 1;
+				peak_hold_counter = PEAK_HOLD_TIME_MS / 10;
+				/* 如果有可疑峰值，清除它（因为出现了更大的峰值，说明之前的是跳变） */
+				suspicious_peak = 0;
+				suspicious_peak_counter = 0;
+			}
+		}
+		
+		if (should_update)
+		{
+			/* 记录本次事件的原始峰值（仅来源于前部区间，单通道PA0） */
+			current_peak_raw = front_peak_value;             // 实际采样通道的原始峰值
 
-		/* 单通道模式下，显示值直接采用前部峰值 */
-		current_peak = front_peak_value;
-		float display_voltage = (float)current_peak / ADC_FULL_SCALE * ADC_REF_VOLTAGE;
-		current_voltage = display_voltage;
-		voltage_sum += current_voltage;                  // 累加电压总和
+			/* 单通道模式下，显示值直接采用前部峰值 */
+			current_peak = front_peak_value;
+			float display_voltage = (float)current_peak / ADC_FULL_SCALE * ADC_REF_VOLTAGE;
+			current_voltage = display_voltage;
+			voltage_sum += current_voltage;                  // 累加电压总和
+			last_valid_peak = front_peak_value;             // 更新保持的峰值
+			last_update_counter = main_loop_counter;        // 更新最近一次峰值更新的主循环计数
+			/* 如果有可疑峰值，清除它（因为出现了更大的峰值，说明之前的是跳变） */
+			suspicious_peak = 0;
+			suspicious_peak_counter = 0;
+		}
+		
 		snapshot_valid_count++;
 
 		drop_count++;                    // 雨滴计数加1

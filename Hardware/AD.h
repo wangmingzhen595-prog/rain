@@ -10,7 +10,7 @@ void AD_Init(void);
 /* 采样与峰值抓取扩展 */
 #define RING_BUFFER_SIZE 1000
 #define SNAPSHOT_PRE_SAMPLES 200
-#define SNAPSHOT_POST_SAMPLES 800
+#define SNAPSHOT_POST_SAMPLES 1300
 #define SNAPSHOT_SIZE (SNAPSHOT_PRE_SAMPLES + SNAPSHOT_POST_SAMPLES)
 
 /* 双通道环形缓冲区（分别为两路信号） */
