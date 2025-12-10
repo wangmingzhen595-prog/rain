@@ -122,6 +122,10 @@ static void Find_Peak_In_Buffer(uint16_t *buf, uint16_t len, int32_t baseline,
                                 uint16_t *peak_index, uint16_t *peak_value,
                                 uint16_t search_start, uint16_t search_end);
 static uint16_t Scale_Value_With_Gain(uint16_t value, float gain);
+static void USART1_Config(void);          // 配置USART1用于VOFA+输出
+static void USART1_SendByte(uint8_t b);   // 发送单字节
+static void USART1_SendFloat_WithTail(float v); // 发送float并附加JustFloat尾标志
+static void Send_Live_Stream(void);       // 连续下采样输出，提供示波数据流
 
 /* 触发与统计变量（当前仅使用PA0单通道） */
 volatile extern uint8_t snapshot_ready;  // 快照就绪标志（外部定义）
@@ -166,6 +170,7 @@ int main(void)
     OLED_Init();                         // 初始化OLED显示屏，配置I2C通信和显示参数
     AD_Init();                           // 初始化ADC和DMA，配置连续采样模式
     AD_SetThreshold(THRESHOLD);          // 设置模拟看门狗阈值
+    USART1_Config();                     // 初始化USART1串口（PA10=TX，PA9=RX，115200 8N1）
     
     // ========== 显示静态内容 ==========
 	OLED_ShowString(1, 1, "Peak:");      // 合并通道峰值
@@ -261,6 +266,8 @@ int main(void)
 					/* 如果有可疑峰值，清除它（因为出现了更大的峰值，说明之前的是跳变） */
 					suspicious_peak = 0;
 					suspicious_peak_counter = 0;
+                    /* 输出到VOFA+：单通道即时值 -> float32 + JustFloat尾标志 */
+                    USART1_SendFloat_WithTail(current_voltage);
 				}
 			}
 			/* 若未达到显示门限，则认为是噪声/微小波动，不刷新显示 */
@@ -315,6 +322,9 @@ int main(void)
 			current_intensity_mmh = Compute_Intensity_MMH(); // 计算当前降雨强度
         }
         
+        /* 连续示波输出：按固定频率发送下采样后的最新ADC值（约1000点/秒） */
+        Send_Live_Stream();
+
         Delay_ms(10);                    // 延时10毫秒，控制循环频率，降低CPU占用率
         display_counter++;               // 显示计数器加1
         system_check_counter++;          // 系统状态计数器加1
@@ -639,6 +649,8 @@ static void Process_Snapshot_IfReady(void)
 			/* 如果有可疑峰值，清除它（因为出现了更大的峰值，说明之前的是跳变） */
 			suspicious_peak = 0;
 			suspicious_peak_counter = 0;
+            /* 输出到VOFA+：单通道即时值 -> float32 + JustFloat尾标志 */
+            USART1_SendFloat_WithTail(current_voltage);
 		}
 		
 		snapshot_valid_count++;
@@ -929,4 +941,117 @@ static uint16_t Scale_Value_With_Gain(uint16_t value, float gain)
 		return (uint16_t)ADC_FULL_SCALE;
 	}
 	return (uint16_t)(scaled + 0.5f);
+}
+
+/**
+  * @brief  配置USART1（PA10=TX, PA9=RX, 115200 8N1）
+  * @note   仅用于向VOFA+发送单通道浮点波形数据
+  */
+static void USART1_Config(void)
+{
+    GPIO_InitTypeDef gpio;
+    USART_InitTypeDef usart;
+
+    /* 开启时钟：GPIOA 与 USART1 */
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_USART1, ENABLE);
+
+    /* PA9 -> USART1_TX: 复用推挽输出 50MHz（USART1默认映射） */
+    gpio.GPIO_Pin = GPIO_Pin_9;
+    gpio.GPIO_Speed = GPIO_Speed_50MHz;
+    gpio.GPIO_Mode = GPIO_Mode_AF_PP;
+    GPIO_Init(GPIOA, &gpio);
+
+    /* PA10 -> USART1_RX: 上拉输入 */
+    gpio.GPIO_Pin = GPIO_Pin_10;
+    gpio.GPIO_Speed = GPIO_Speed_50MHz;
+    gpio.GPIO_Mode = GPIO_Mode_IPU;
+    GPIO_Init(GPIOA, &gpio);
+
+    USART_StructInit(&usart);
+    usart.USART_BaudRate = 115200;
+    usart.USART_WordLength = USART_WordLength_8b;
+    usart.USART_StopBits = USART_StopBits_1;
+    usart.USART_Parity = USART_Parity_No;
+    usart.USART_Mode = USART_Mode_Tx | USART_Mode_Rx;
+    usart.USART_HardwareFlowControl = USART_HardwareFlowControl_None;
+    USART_Init(USART1, &usart);
+
+    USART_Cmd(USART1, ENABLE);
+}
+
+/**
+  * @brief  发送单字节（阻塞方式）
+  */
+static void USART1_SendByte(uint8_t b)
+{
+    while (USART_GetFlagStatus(USART1, USART_FLAG_TXE) == RESET)
+    {
+        /* 等待发送缓冲空 */
+    }
+    USART_SendData(USART1, b);
+}
+
+/**
+  * @brief  发送float并追加JustFloat尾标志 {00 00 80 7F}
+  * @note   VOFA+ JustFloat引擎：仅需要在数据后追加尾标志即可，按小端发送
+  */
+static void USART1_SendFloat_WithTail(float v)
+{
+    const uint8_t jf_tail[4] = {0x00, 0x00, 0x80, 0x7F};
+    union
+    {
+        float f;
+        uint8_t b[4];
+    } u;
+    u.f = v;
+
+    /* 发送float小端字节 */
+    USART1_SendByte(u.b[0]);
+    USART1_SendByte(u.b[1]);
+    USART1_SendByte(u.b[2]);
+    USART1_SendByte(u.b[3]);
+
+    /* 发送JustFloat结束标志 */
+    USART1_SendByte(jf_tail[0]);
+    USART1_SendByte(jf_tail[1]);
+    USART1_SendByte(jf_tail[2]);
+    USART1_SendByte(jf_tail[3]);
+}
+
+/**
+  * @brief  连续下采样输出ADC值，提供VOFA+示波数据流
+  * @note   目标速率约1000点/秒：每次主循环(10ms)最多发送10点
+  */
+static void Send_Live_Stream(void)
+{
+    extern volatile uint16_t adc_ring_buffer_ch0[RING_BUFFER_SIZE];
+    extern volatile uint16_t ring_write_index_ch0;
+
+    /* 每次调用发送的最大点数；主循环10ms调用一次 -> 10点/10ms ≈ 1000点/s */
+    const uint8_t max_points = 10;
+
+    static uint16_t last_index = 0;
+
+    uint16_t write_idx = ring_write_index_ch0;
+    uint16_t available;
+    if (write_idx >= last_index)
+    {
+        available = write_idx - last_index;
+    }
+    else
+    {
+        available = (uint16_t)(RING_BUFFER_SIZE - last_index + write_idx);
+    }
+
+    /* 限制发送数量，避免带宽溢出 */
+    uint16_t to_send = (available > max_points) ? max_points : available;
+    for (uint16_t i = 0; i < to_send; i++)
+    {
+        uint16_t idx = (last_index + i) % RING_BUFFER_SIZE;
+        uint16_t raw = adc_ring_buffer_ch0[idx];
+        float v = (float)raw / ADC_FULL_SCALE * ADC_REF_VOLTAGE;
+        USART1_SendFloat_WithTail(v);
+    }
+
+    last_index = (uint16_t)((last_index + to_send) % RING_BUFFER_SIZE);
 }
