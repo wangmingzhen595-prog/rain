@@ -1,27 +1,39 @@
-# Keil编译产物
+# Keil编译生成文件
 Objects/
 Listings/
 *.uvguix*
 *.uvoptx
 *.bak
-
-# 调试文件
-DebugConfig/
-*.scvd
+*.lst
+*.map
+*.o
+*.d
+*.crf
+*.htm
+*.lnp
+*.plg
+*.tra
+*.iex
+*.dep
+*.axf
+*.hex
+*.bin
 
 # 临时文件
 *.tmp
-*.log
+*.swp
+*~
+.DS_Store
 
-# Windows
-Thumbs.db
-Desktop.ini
-
-# IDE配置文件
-.cursor/
+# IDE文件
+.vscode/
 .idea/
-*.iml
+*.suo
+*.user
 
-# 文档文件（可选，根据需要）
+# 文档（保留README.md）
 *.docx
+需求文档.docx
 
+# 批处理脚本（保留git_push.bat）
+# upload*.bat

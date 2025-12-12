@@ -14,11 +14,11 @@ volatile uint16_t adc_ring_buffer_ch1[RING_BUFFER_SIZE];  // 通道1环形缓冲
 volatile uint16_t ring_write_index_ch0 = 0;  // 通道0写索引
 volatile uint16_t ring_write_index_ch1 = 0;  // 通道1写索引
 
-/* Keil Array Visualization 可观察数组（1000个元素） */
+/* Keil Array Visualization 可观察数组（500个元素） */
 /* 用于在Keil调试器中观察ADC采样数据，确保数组在文件作用域声明为全局变量 */
 /* 使用说明：在Keil调试器的Watch窗口中，添加 ADC_Visualize_Buffer 变量，
    然后右键选择 Array Visualization 即可查看波形 */
-volatile uint16_t ADC_Visualize_Buffer[1000];  // ADC可视化缓冲区（通道0数据）
+volatile uint16_t ADC_Visualize_Buffer[500];  // ADC可视化缓冲区（通道0数据）
 volatile uint16_t ADC_Visualize_Index = 0;     // 可视化缓冲区写索引
 
 

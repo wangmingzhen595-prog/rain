@@ -8,7 +8,7 @@
 #include "stm32f10x_rcc.h"               // 时钟控制头文件
 
 // ========== 系统参数定义 ==========
-#define THRESHOLD 620                     // 初始阈值（ADC单位，500mV = 0.5V / 3.3V * 4095 ≈ 620）
+#define THRESHOLD 496                     // 初始阈值（ADC单位，400mV = 400/3.3*4095 ≈ 496）
 
 /* 增益配置：CH0=高增益、CH1=低增益（默认≈15倍 vs 1倍，可按需调整） */
 #define HIGH_GAIN_FACTOR         15.0f
@@ -20,24 +20,40 @@
 
 /* 自适应阈值相关 */
 #define NOISE_WINDOW            200      // 噪声统计窗口长度（从环形缓冲末端向前取）
-#define MIN_THRESHOLD           620       // 阈值下限，防止过低（500mV）
+#define MIN_THRESHOLD           496       // 阈值下限，防止过低（400mV = 400/3.3*4095 ≈ 496）
 #define MAX_THRESHOLD           3000     // 阈值上限，防止过高
 #define MAD_GAIN                3        // 平均绝对偏差放大倍数
 #define HYSTERESIS_MARGIN       15       // 阈值滞回，降低抖动
 
 /* 事件与抗干扰判定 */
-#define MIN_PEAK_DELTA_OVER_THR 12       // 峰值需高出阈值的最小余量（约10mV）
-#define MIN_LOCAL_DELTA         8        // 峰值相对于邻近样本的最小差值
+#define MIN_PEAK_DELTA_OVER_THR 8        // 峰值需高出阈值的最小余量（约6.5mV，适配小信号）
+#define MIN_LOCAL_DELTA         6        // 峰值相对于邻近样本的最小差值（适配小信号）
 #define MIN_RISE_SAMPLES        3        // 峰前上升最少采样点数
 #define MIN_DECAY_SAMPLES       3        // 峰后下降最少采样点数
 #define SHAPE_WINDOW_PRE        12       // 峰前用于形状判定的样本数
 #define SHAPE_WINDOW_POST       24       // 峰后用于形状判定的样本数
+
+/* 时间特征判定参数：区分真实雨滴信号和噪声干扰 */
+#define MIN_RISE_TIME_US        300      // 最小上升时间（微秒），适配小雨滴信号（降低到300us）
+#define MIN_FALL_TIME_US        300      // 最小下降时间（微秒），适配小雨滴信号（降低到300us）
+#define MIN_PULSE_DURATION_US   600      // 最小脉冲持续时间（微秒），适配小雨滴信号（降低到600us，约0.6ms）
+#define MAX_NOISE_PULSE_WIDTH   10       // 最大噪声脉冲宽度（采样点数），超过此宽度才可能是真实信号（约420us）
+
+/* 形状平滑度判定参数：真实信号相对平滑，干扰可能很陡峭 */
+#define MIN_SMOOTH_RISE_RATIO   0.25f    // 最小平滑上升比例：适配小雨滴信号（降低到25%）
+#define MIN_SMOOTH_FALL_RATIO   0.25f    // 最小平滑下降比例：适配小雨滴信号（降低到25%）
+#define MAX_STEEP_SLOPE         50       // 最大陡峭斜率（ADC单位/样本），适配小雨滴信号（提高到50）
+#define PEAK_STABILITY_WINDOW   5        // 峰值稳定性窗口：峰值附近±N个样本应该接近峰值
+#define PEAK_STABILITY_DELTA    30       // 峰值稳定性容差：峰值附近样本与峰值的最大差值
+
+/* 信号平滑滤波参数 */
+#define SMOOTH_FILTER_SIZE      3        // 移动平均滤波窗口大小（3点或5点）
 #define BASELINE_SAMPLE_COUNT   80       // 基线估算样本数
 #define LOCAL_REFINEMENT_RADIUS 6        // 峰值局部搜索半径
-#define MIN_PEAK_AMPLITUDE      1500     // 最小峰值幅度（ADC单位，约1.2V），过滤噪声
+#define MIN_PEAK_AMPLITUDE      500      // 最小峰值幅度（ADC单位，约400mV），适配420-540mV小雨滴信号
 
 /* 显示门限：小于该幅度的脉冲不刷新OLED（仅在主循环中使用） */
-#define DISPLAY_MIN_AMPLITUDE   1200     // 显示下限约 1.0V，可按需要微调
+#define DISPLAY_MIN_AMPLITUDE   400      // 显示下限约 320mV，适配420-540mV小雨滴信号显示
 
 /* 峰值检测状态机定义 */
 #define PEAK_STATE_IDLE         0        // 空闲状态
@@ -425,8 +441,8 @@ void Check_System_Status(void)
  *         
  *         预触发处理时间计算（基于ADC_SAMPLE_INTERVAL_US = 42us）：
  *         - 预触发200点：200 × 42us = 8.4ms（从环形缓冲复制历史数据）
- *         - 后触发1300点：1300 × 42us = 54.6ms（继续采集实时数据）
- *         - 总快照窗口：1500 × 42us = 63ms（确保整个脉冲包括后部震荡都在快照内）
+ *         - 后触发300点：300 × 42us = 12.6ms（继续采集实时数据）
+ *         - 总快照窗口：500 × 42us = 21ms（确保整个脉冲包括后部震荡都在快照内）
  *         - 触发点位置：索引200（峰值应位于此位置附近）
  *         
  *         注意：模拟看门狗触发后，DMA中断会在下一个样本处理时响应，延迟约1个采样周期（42us）
@@ -699,6 +715,8 @@ static void Update_Adaptive_Threshold(void)
 		return;
 
 	/* ========== 通道0阈值计算（单通道PA0） ========== */
+	/* 改进：排除异常峰值，避免干扰影响阈值计算 */
+	/* 先计算均值，然后排除明显异常值（超过均值+3*MAD的样本） */
 	sum = 0;
 	start = (int16_t)ring_write_index_ch0 - NOISE_WINDOW;
 	if (start < 0) start += RING_BUFFER_SIZE;
@@ -707,6 +725,36 @@ static void Update_Adaptive_Threshold(void)
 		sum += adc_ring_buffer_ch0[(start + i) % RING_BUFFER_SIZE];
 	}
 	mean_times_1 = sum / (int32_t)NOISE_WINDOW;
+	
+	/* 计算MAD用于识别异常值 */
+	mad_sum = 0;
+	for (i = 0; i < NOISE_WINDOW; i++)
+	{
+		int32_t v = (int32_t)adc_ring_buffer_ch0[(start + i) % RING_BUFFER_SIZE];
+		int32_t d = v - mean_times_1;
+		if (d < 0) d = -d;
+		mad_sum += d;
+	}
+	int32_t mad_pre = mad_sum / (int32_t)NOISE_WINDOW;
+	
+	/* 排除异常值后重新计算均值 */
+	sum = 0;
+	uint16_t valid_count = 0;
+	int32_t outlier_threshold = mean_times_1 + (int32_t)(3 * mad_pre);
+	for (i = 0; i < NOISE_WINDOW; i++)
+	{
+		int32_t v = (int32_t)adc_ring_buffer_ch0[(start + i) % RING_BUFFER_SIZE];
+		/* 排除明显异常值（可能是干扰峰值） */
+		if (v <= outlier_threshold)
+		{
+			sum += v;
+			valid_count++;
+		}
+	}
+	if (valid_count > 0)
+	{
+		mean_times_1 = sum / (int32_t)valid_count;
+	}
 
 	mad_sum = 0;
 	for (i = 0; i < NOISE_WINDOW; i++)
@@ -719,7 +767,7 @@ static void Update_Adaptive_Threshold(void)
 	mad = mad_sum / (int32_t)NOISE_WINDOW;
 
 	target = mean_times_1 + (int32_t)(MAD_GAIN * mad);
-	if (target < MIN_THRESHOLD) target = MIN_THRESHOLD; // 限制最小值500mV
+	if (target < MIN_THRESHOLD) target = MIN_THRESHOLD; // 限制最小值400mV
 	if (target > MAX_THRESHOLD) target = MAX_THRESHOLD;
 
 	if ((int32_t)dynamic_threshold - target > HYSTERESIS_MARGIN ||
@@ -727,6 +775,54 @@ static void Update_Adaptive_Threshold(void)
 	{
 		dynamic_threshold = (uint16_t)target;
 		AD_SetThreshold(dynamic_threshold); // 设置ADC模拟看门狗阈值（通道0/PA0）
+	}
+}
+
+/**
+  * @brief  对缓冲区进行移动平均滤波，减少ADC量化噪声
+  * @param  buf: 输入缓冲区
+  * @param  smoothed: 输出平滑后的缓冲区
+  * @param  len: 缓冲区长度
+  * @param  start_idx: 起始索引
+  * @param  end_idx: 结束索引
+  * @retval 无
+  */
+static void Smooth_Filter(uint16_t *buf, uint16_t *smoothed, uint16_t len, uint16_t start_idx, uint16_t end_idx)
+{
+	uint16_t i;
+	uint16_t half_window = SMOOTH_FILTER_SIZE / 2;
+	
+	for (i = start_idx; i <= end_idx && i < len; i++)
+	{
+		uint32_t sum = 0;
+		uint16_t count = 0;
+		
+		/* 计算移动平均：取当前点及其前后各half_window个点 */
+		int16_t win_start = (int16_t)i - (int16_t)half_window;
+		int16_t win_end = (int16_t)i + (int16_t)half_window;
+		
+		/* 限制窗口范围在有效区间内 */
+		if (win_start < (int16_t)start_idx) win_start = (int16_t)start_idx;
+		if (win_end > (int16_t)end_idx) win_end = (int16_t)end_idx;
+		if (win_end >= (int16_t)len) win_end = (int16_t)len - 1;
+		
+		for (int16_t j = win_start; j <= win_end; j++)
+		{
+			if (j >= 0 && j < (int16_t)len)
+			{
+				sum += buf[j];
+				count++;
+			}
+		}
+		
+		if (count > 0)
+		{
+			smoothed[i] = (uint16_t)(sum / count);
+		}
+		else
+		{
+			smoothed[i] = buf[i];
+		}
 	}
 }
 
@@ -754,6 +850,37 @@ static uint8_t Validate_And_Count_Event(uint16_t *buf, uint16_t len, uint16_t pe
 		end_index = len - 1;
 	if (peak_index < start_index || peak_index > end_index)
 		return 0;
+	
+	/* 0) 信号平滑滤波：减少ADC量化噪声，让信号特征更明显 */
+	/* 创建平滑后的缓冲区（使用静态数组避免动态分配） */
+	static uint16_t smoothed_buf[SNAPSHOT_SIZE];
+	uint16_t smooth_start = (start_index > 0) ? (start_index - 1) : 0;
+	uint16_t smooth_end = (end_index < len - 1) ? (end_index + 1) : (len - 1);
+	
+	/* 对有效区间进行平滑滤波 */
+	Smooth_Filter(buf, smoothed_buf, len, smooth_start, smooth_end);
+	
+	/* 使用平滑后的数据进行后续判定 */
+	uint16_t *filtered_buf = smoothed_buf;
+	
+	/* 重新计算平滑后的峰值（在峰值附近搜索） */
+	uint16_t filtered_peak_value = filtered_buf[peak_index];
+	uint16_t filtered_peak_index = peak_index;
+	for (i = (peak_index > 2) ? (peak_index - 2) : 0; 
+	     i <= ((peak_index + 2 < len) ? (peak_index + 2) : (len - 1)); 
+	     i++)
+	{
+		if (filtered_buf[i] > filtered_peak_value)
+		{
+			filtered_peak_value = filtered_buf[i];
+			filtered_peak_index = i;
+		}
+	}
+	
+	/* 更新使用平滑后的峰值和缓冲区 */
+	peak_value = filtered_peak_value;
+	peak_index = filtered_peak_index;
+	buf = filtered_buf;
 
 	/* 1) 幅值判定 */
 	if (peak_value <= threshold) return 0; // 如果峰值不超过通道阈值
@@ -807,7 +934,183 @@ static uint8_t Validate_And_Count_Event(uint16_t *buf, uint16_t len, uint16_t pe
 		return 0;
 	}
 
-	/* 3) 通过判定 */
+	/* 3) 时间特征判定：区分真实雨滴信号和噪声干扰 */
+	/* 真实信号：上升→峰值→下降有一定时间，噪声：快速毛刺 */
+	
+	/* 3.1 快速过滤明显毛刺：脉冲宽度太窄直接判定为噪声 */
+	uint16_t pulse_width_samples = end_index - start_index + 1;
+	if (pulse_width_samples <= MAX_NOISE_PULSE_WIDTH)
+	{
+		/* 脉冲宽度小于等于10个采样点（约420us），判定为噪声毛刺 */
+		return 0;
+	}
+	
+	/* 3.2 计算上升时间：从开始到峰值的时间 */
+	uint16_t rise_samples = (peak_index > start_index) ? (peak_index - start_index) : 1;
+	float rise_time_us = (float)rise_samples * ADC_SAMPLE_INTERVAL_US;
+	
+	/* 3.3 计算下降时间：从峰值到结束的时间 */
+	uint16_t fall_samples = (end_index > peak_index) ? (end_index - peak_index) : 1;
+	float fall_time_us = (float)fall_samples * ADC_SAMPLE_INTERVAL_US;
+	
+	/* 3.4 计算总脉冲持续时间 */
+	float pulse_duration_us = (float)pulse_width_samples * ADC_SAMPLE_INTERVAL_US;
+	
+	/* 3.5 时间特征判定：真实信号必须有足够的上升时间、下降时间和总持续时间 */
+	if (rise_time_us < MIN_RISE_TIME_US)
+	{
+		/* 上升时间太短，可能是快速毛刺噪声 */
+		return 0;
+	}
+	
+	if (fall_time_us < MIN_FALL_TIME_US)
+	{
+		/* 下降时间太短，可能是快速毛刺噪声 */
+		return 0;
+	}
+	
+	if (pulse_duration_us < MIN_PULSE_DURATION_US)
+	{
+		/* 总持续时间太短，可能是快速毛刺噪声 */
+		return 0;
+	}
+	
+	/* 3.6 上升下降平滑度判定：真实信号相对平滑，干扰可能很陡峭 */
+	/* 计算上升过程中的平滑上升比例 */
+	uint16_t smooth_rise_count = 0;
+	uint16_t continuous_rise_count = 0;  // 连续上升计数
+	uint16_t max_continuous_rise = 0;    // 最大连续上升长度
+	uint16_t total_rise_samples = (peak_index > start_index) ? (peak_index - start_index) : 1;
+	if (total_rise_samples > 1)
+	{
+		for (i = start_index + 1; i <= peak_index; i++)
+		{
+			uint16_t diff = (buf[i] > buf[i - 1]) ? (buf[i] - buf[i - 1]) : 0;
+			/* 平滑上升：差值不超过最大陡峭斜率 */
+			if (diff > 0 && diff <= MAX_STEEP_SLOPE)
+			{
+				smooth_rise_count++;
+				continuous_rise_count++;
+				if (continuous_rise_count > max_continuous_rise)
+				{
+					max_continuous_rise = continuous_rise_count;
+				}
+			}
+			else
+			{
+				continuous_rise_count = 0;  // 重置连续计数
+			}
+		}
+	}
+	float smooth_rise_ratio = (total_rise_samples > 0) ? 
+		((float)smooth_rise_count / (float)total_rise_samples) : 0.0f;
+	
+	/* 计算下降过程中的平滑下降比例 */
+	uint16_t smooth_fall_count = 0;
+	uint16_t continuous_fall_count = 0;  // 连续下降计数
+	uint16_t max_continuous_fall = 0;     // 最大连续下降长度
+	uint16_t total_fall_samples = (end_index > peak_index) ? (end_index - peak_index) : 1;
+	if (total_fall_samples > 1)
+	{
+		for (i = peak_index + 1; i <= end_index; i++)
+		{
+			uint16_t diff = (buf[i - 1] > buf[i]) ? (buf[i - 1] - buf[i]) : 0;
+			/* 平滑下降：差值不超过最大陡峭斜率 */
+			if (diff > 0 && diff <= MAX_STEEP_SLOPE)
+			{
+				smooth_fall_count++;
+				continuous_fall_count++;
+				if (continuous_fall_count > max_continuous_fall)
+				{
+					max_continuous_fall = continuous_fall_count;
+				}
+			}
+			else
+			{
+				continuous_fall_count = 0;  // 重置连续计数
+			}
+		}
+	}
+	float smooth_fall_ratio = (total_fall_samples > 0) ? 
+		((float)smooth_fall_count / (float)total_fall_samples) : 0.0f;
+	
+	/* 增强判定：要求有足够的连续上升/下降，确保信号有明确的趋势 */
+	/* 根据信号幅度动态调整要求：小雨滴信号可能连续性稍弱 */
+	uint16_t min_continuous_required;
+	if (peak_value > 650)  // 大于650 ADC单位（约520mV），要求更严格
+	{
+		min_continuous_required = (total_rise_samples > 5) ? 3 : 2;
+	}
+	else  // 小雨滴信号（420-540mV），要求放宽
+	{
+		min_continuous_required = 1;  // 至少连续1个样本即可，降低要求
+	}
+	
+	/* 只在样本数足够多时才检查连续性，避免误判小雨滴 */
+	if (max_continuous_rise < min_continuous_required && total_rise_samples > 5)
+	{
+		/* 上升过程缺乏连续性，可能是噪声（但样本数要足够多才判定） */
+		return 0;
+	}
+	if (max_continuous_fall < min_continuous_required && total_fall_samples > 5)
+	{
+		/* 下降过程缺乏连续性，可能是噪声（但样本数要足够多才判定） */
+		return 0;
+	}
+	
+	/* 平滑度判定：真实信号应该有足够的平滑上升和下降 */
+	if (smooth_rise_ratio < MIN_SMOOTH_RISE_RATIO)
+	{
+		/* 上升过程不够平滑，可能是陡峭干扰 */
+		return 0;
+	}
+	
+	if (smooth_fall_ratio < MIN_SMOOTH_FALL_RATIO)
+	{
+		/* 下降过程不够平滑，可能是陡峭干扰 */
+		return 0;
+	}
+	
+	/* 3.7 峰值稳定性判定：真实信号峰值相对稳定，干扰峰值可能波动大 */
+	uint16_t peak_stable_count = 0;
+	uint16_t peak_check_start = (peak_index > PEAK_STABILITY_WINDOW) ? 
+		(peak_index - PEAK_STABILITY_WINDOW) : start_index;
+	uint16_t peak_check_end = (peak_index + PEAK_STABILITY_WINDOW < end_index) ? 
+		(peak_index + PEAK_STABILITY_WINDOW) : end_index;
+	
+	for (i = peak_check_start; i <= peak_check_end; i++)
+	{
+		uint16_t diff = (peak_value > buf[i]) ? (peak_value - buf[i]) : (buf[i] - peak_value);
+		/* 峰值附近样本应该接近峰值（在容差范围内） */
+		if (diff <= PEAK_STABILITY_DELTA)
+		{
+			peak_stable_count++;
+		}
+	}
+	
+	/* 峰值稳定性判定：峰值附近至少应该有部分样本接近峰值 */
+	uint16_t peak_check_samples = peak_check_end - peak_check_start + 1;
+	float peak_stability_ratio = (peak_check_samples > 0) ? 
+		((float)peak_stable_count / (float)peak_check_samples) : 0.0f;
+	
+	/* 根据信号幅度动态调整峰值稳定性要求：小雨滴信号可能峰值稳定性稍弱 */
+	float min_stability_ratio;
+	if (peak_value > 650)  // 大于650 ADC单位（约520mV），要求更严格
+	{
+		min_stability_ratio = 0.3f;  // 30%
+	}
+	else  // 小雨滴信号，要求放宽
+	{
+		min_stability_ratio = 0.2f;  // 20%，降低要求
+	}
+	
+	if (peak_stability_ratio < min_stability_ratio)
+	{
+		/* 峰值不够稳定，可能是孤立尖峰干扰 */
+		return 0;
+	}
+
+	/* 4) 通过所有判定：确认为真实雨滴信号 */
 	return 1;                            // 返回有效事件
 }
 

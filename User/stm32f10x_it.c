@@ -41,7 +41,7 @@
 #define PEAK_LOCK_BASELINE_DELTA 30      // 回落到基线附近的阈值（ADC单位），用于提前锁定峰值
 
 /* 后部噪声过滤参数：避免后部噪声误判为新峰值 */
-#define IDLE_TRIGGER_MARGIN     100      // IDLE状态触发阈值余量（ADC单位），避免后部小波动触发
+#define IDLE_TRIGGER_MARGIN     50       // IDLE状态触发阈值余量（ADC单位），适配小信号检测
 #define IDLE_TRIGGER_CONSEC     3        // IDLE状态需要连续N个样本都超过阈值才触发
 #define STABLE_PERIOD_COUNT     100      // 稳定期样本数，WAIT_FALL完成后需要值在基线附近保持的样本数（约4.2ms，确保后部震荡完全结束）
 #define STABLE_BASELINE_DELTA   50       // 稳定期基线附近的范围（ADC单位）
@@ -50,7 +50,7 @@
 #define DEAD_TIME_MAX           200      // 最大死区时间
 
 /* 差值触发配置 */
-#define DIFF_TRIGGER_THRESHOLD      180   // 差分触发阈值（ADC单位，约150mV@15倍增益），过滤噪声
+#define DIFF_TRIGGER_THRESHOLD      100   // 差分触发阈值（ADC单位，约80mV），适配小信号检测
 #define DIFF_TRIGGER_CONSEC         2     // 连续满足差分阈值的样本数
 #define DIFF_TRIGGER_COOLDOWN       150   // 触发后冷却样本数，避免重复触发
 
@@ -365,8 +365,9 @@ static void Process_ADC_Sample(uint8_t channel, uint16_t value, uint16_t ring_in
             if (value < (ctx->baseline_value + RETURN_THRESHOLD))
             {
                 /* 脉冲完成：记录本次完整脉冲的峰值（仅通道0/PA0），供主循环显示使用 */
-                /* 验证峰值是否明显大于基线，过滤后部噪声（后部噪声通常不会明显大于基线） */
-                if (channel == 0 && ctx->local_max > (ctx->baseline_value + 500))
+                /* 验证峰值是否明显大于基线，过滤后部噪声和ADC数字噪声（后部噪声通常不会明显大于基线） */
+                /* 降低阈值到80，适配420-540mV小雨滴信号（约320-410mV相对基线） */
+                if (channel == 0 && ctx->local_max > (ctx->baseline_value + 80))
                 {
                     last_peak_value_from_isr = ctx->local_max;
                     last_peak_index_from_isr = ctx->local_max_index;
@@ -503,7 +504,7 @@ void DMA1_Channel1_IRQHandler(void)
     extern volatile uint16_t snapshot_buffer_high[SNAPSHOT_SIZE];
     extern volatile uint16_t snapshot_write_index;
     extern volatile uint8_t snapshot_ready;
-    extern volatile uint16_t ADC_Visualize_Buffer[1000];
+    extern volatile uint16_t ADC_Visualize_Buffer[500];
     
     /* 半传输：处理前半缓冲（0~49），单通道数据写入环形缓冲区 */
     /* 单通道模式下：AD_Value[i] 全部为通道0（PA0）数据 */
@@ -563,12 +564,12 @@ void DMA1_Channel1_IRQHandler(void)
                 }
             }
         }
-        /* 更新Keil Array Visualization可视化数组：将最新的1000个通道0数据复制到可视化缓冲区 */
+        /* 更新Keil Array Visualization可视化数组：将最新的500个通道0数据复制到可视化缓冲区 */
         {
-            int16_t start_idx = (int16_t)ring_write_index_ch0 - 1000;
+            int16_t start_idx = (int16_t)ring_write_index_ch0 - 500;
             uint16_t i;
             if (start_idx < 0) start_idx += RING_BUFFER_SIZE;
-            for (i = 0; i < 1000; i++)
+            for (i = 0; i < 500; i++)
             {
                 ADC_Visualize_Buffer[i] = adc_ring_buffer_ch0[(start_idx + i) % RING_BUFFER_SIZE];
             }

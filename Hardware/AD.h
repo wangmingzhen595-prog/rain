@@ -8,9 +8,9 @@ extern uint16_t AD_Value[100];
 void AD_Init(void);
 
 /* 采样与峰值抓取扩展 */
-#define RING_BUFFER_SIZE 1000
+#define RING_BUFFER_SIZE 500
 #define SNAPSHOT_PRE_SAMPLES 200
-#define SNAPSHOT_POST_SAMPLES 1300
+#define SNAPSHOT_POST_SAMPLES 300
 #define SNAPSHOT_SIZE (SNAPSHOT_PRE_SAMPLES + SNAPSHOT_POST_SAMPLES)
 
 /* 双通道环形缓冲区（分别为两路信号） */
@@ -31,7 +31,7 @@ extern volatile uint16_t snapshot_peak_index;
 extern volatile uint32_t sampling_tick_counter;
 
 /* Keil Array Visualization 可观察数组（用于调试） */
-extern volatile uint16_t ADC_Visualize_Buffer[1000];  // ADC可视化缓冲区（通道0数据）
+extern volatile uint16_t ADC_Visualize_Buffer[500];  // ADC可视化缓冲区（通道0数据）
 extern volatile uint16_t ADC_Visualize_Index;         // 可视化缓冲区写索引
 
 /* 阈值接口（ADC单位，默认200，可在main中覆盖） */

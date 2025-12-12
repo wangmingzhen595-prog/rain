@@ -1,27 +1,23 @@
-# Git命令序列（如果git已安装，可以复制这些命令到命令行执行）
+# Git推送命令（手动执行）
 
-# 1. 初始化git仓库
+# 1. 初始化Git仓库（如果还没有）
 git init
 
-# 2. 添加所有文件
+# 2. 添加远程仓库
+git remote add origin https://github.com/wangmingzhen595-prog/rain.git
+# 如果已存在，使用：
+# git remote set-url origin https://github.com/wangmingzhen595-prog/rain.git
+
+# 3. 添加所有文件
 git add .
 
-# 3. 提交更改
-git commit -m "初始提交：STM32雨滴传感器检测系统，已修复电压显示跳变问题"
+# 4. 提交更改
+git commit -m "优化小雨滴检测：支持420-540mV信号检测，添加移动平均滤波和时间特征判定，提高噪声区分能力"
 
-# 4. 重命名分支为main
+# 5. 推送到GitHub（main分支）
 git branch -M main
-
-# 5. 添加远程仓库
-git remote add origin https://github.com/wangmingzhen595-prog/-.git
-
-# 6. 推送到GitHub
 git push -u origin main
 
-# 注意：
-# - 如果远程仓库已存在，可能需要先执行：git pull origin main --allow-unrelated-histories
-# - 如果提示需要认证，请使用GitHub Personal Access Token而不是密码
-# - 首次使用git需要配置用户信息：
-#   git config --global user.name "你的名字"
-#   git config --global user.email "你的邮箱"
-
+# 如果main分支失败，尝试master分支：
+# git branch -M master
+# git push -u origin master
