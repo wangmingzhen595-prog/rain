@@ -1,0 +1,27 @@
+# Git命令序列（如果git已安装，可以复制这些命令到命令行执行）
+
+# 1. 初始化git仓库
+git init
+
+# 2. 添加所有文件
+git add .
+
+# 3. 提交更改
+git commit -m "初始提交：STM32雨滴传感器检测系统，已修复电压显示跳变问题"
+
+# 4. 重命名分支为main
+git branch -M main
+
+# 5. 添加远程仓库
+git remote add origin https://github.com/wangmingzhen595-prog/-.git
+
+# 6. 推送到GitHub
+git push -u origin main
+
+# 注意：
+# - 如果远程仓库已存在，可能需要先执行：git pull origin main --allow-unrelated-histories
+# - 如果提示需要认证，请使用GitHub Personal Access Token而不是密码
+# - 首次使用git需要配置用户信息：
+#   git config --global user.name "你的名字"
+#   git config --global user.email "你的邮箱"
+

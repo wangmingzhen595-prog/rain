@@ -1,0 +1,27 @@
+# Keil编译产物
+Objects/
+Listings/
+*.uvguix*
+*.uvoptx
+*.bak
+
+# 调试文件
+DebugConfig/
+*.scvd
+
+# 临时文件
+*.tmp
+*.log
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# IDE配置文件
+.cursor/
+.idea/
+*.iml
+
+# 文档文件（可选，根据需要）
+*.docx
+
