@@ -8,9 +8,9 @@ extern uint16_t AD_Value[200];  // 双通道扫描模式：100个PA0+100个PA1�
 void AD_Init(void);
 
 /* 采样与峰值抓取扩展 */
-#define RING_BUFFER_SIZE 500
-#define SNAPSHOT_PRE_SAMPLES 200
-#define SNAPSHOT_POST_SAMPLES 300
+#define RING_BUFFER_SIZE 512  /* 覆盖主循环10ms调度间隔，避免写索引绕回造成丢样不可见 */
+#define SNAPSHOT_PRE_SAMPLES 32  /* 缩减：原64 */
+#define SNAPSHOT_POST_SAMPLES 32  /* 缩减：原64 */
 #define SNAPSHOT_SIZE (SNAPSHOT_PRE_SAMPLES + SNAPSHOT_POST_SAMPLES)
 
 /* 双通道环形缓冲区（分别为两路信号） */
@@ -18,6 +18,8 @@ extern volatile uint16_t adc_ring_buffer_ch0[RING_BUFFER_SIZE];  // 通道0环�
 extern volatile uint16_t adc_ring_buffer_ch1[RING_BUFFER_SIZE];  // 通道1环形缓冲区
 extern volatile uint16_t ring_write_index_ch0;  // 通道0写索引
 extern volatile uint16_t ring_write_index_ch1;  // 通道1写索引
+extern volatile uint32_t ring_write_total_ch0;  // 通道0累计写入样本数
+extern volatile uint32_t ring_write_total_ch1;  // 通道1累计写入样本数
 
 
 extern volatile uint8_t snapshot_ready;
@@ -32,7 +34,7 @@ extern volatile uint16_t snapshot_trigger_index_ch0; /* 快照触发时的PA0环
 extern volatile uint32_t sampling_tick_counter;
 
 /* Keil Array Visualization 可观察数组（用于调试） */
-extern volatile uint16_t ADC_Visualize_Buffer[500];  // ADC可视化缓冲区（通道0数据）
+extern volatile uint16_t ADC_Visualize_Buffer[64];  // ADC可视化缓冲区（通道0数据）
 extern volatile uint16_t ADC_Visualize_Index;         // 可视化缓冲区写索引
 
 /* 阈值接口（ADC单位，默认200，可在main中覆盖） */

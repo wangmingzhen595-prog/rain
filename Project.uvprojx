@@ -133,12 +133,12 @@
             <UseExternalTool>0</UseExternalTool>
             <RunIndependent>0</RunIndependent>
             <UpdateFlashBeforeDebugging>1</UpdateFlashBeforeDebugging>
-            <Capability>0</Capability>
-            <DriverSelection>-1</DriverSelection>
+            <Capability>1</Capability>
+            <DriverSelection>4096</DriverSelection>
           </Flash1>
           <bUseTDR>1</bUseTDR>
           <Flash2>BIN\UL2CM3.DLL</Flash2>
-          <Flash3></Flash3>
+          <Flash3>"" ()</Flash3>
           <Flash4></Flash4>
           <pFcarmOut></pFcarmOut>
           <pFcarmGrp></pFcarmGrp>
@@ -666,26 +666,6 @@
           <GroupName>Hardware</GroupName>
           <Files>
             <File>
-              <FileName>LED.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\Hardware\LED.c</FilePath>
-            </File>
-            <File>
-              <FileName>LED.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>.\Hardware\LED.h</FilePath>
-            </File>
-            <File>
-              <FileName>Key.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\Hardware\Key.c</FilePath>
-            </File>
-            <File>
-              <FileName>Key.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>.\Hardware\Key.h</FilePath>
-            </File>
-            <File>
               <FileName>OLED.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\Hardware\OLED.c</FilePath>
@@ -721,14 +701,54 @@
               <FilePath>.\Hardware\TF_Comm.h</FilePath>
             </File>
             <File>
-              <FileName>Wavelet.c</FileName>
+              <FileName>WaveletEnergy.c</FileName>
               <FileType>1</FileType>
-              <FilePath>.\Hardware\Wavelet.c</FilePath>
+              <FilePath>.\Hardware\WaveletEnergy.c</FilePath>
             </File>
             <File>
-              <FileName>Wavelet.h</FileName>
+              <FileName>WaveletEnergy.h</FileName>
               <FileType>5</FileType>
-              <FilePath>.\Hardware\Wavelet.h</FilePath>
+              <FilePath>.\Hardware\WaveletEnergy.h</FilePath>
+            </File>
+            <File>
+              <FileName>Modbus_Slave.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Hardware\Modbus_Slave.c</FilePath>
+            </File>
+            <File>
+              <FileName>Modbus_Slave.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Hardware\Modbus_Slave.h</FilePath>
+            </File>
+            <File>
+              <FileName>RegisterMap.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Hardware\RegisterMap.c</FilePath>
+            </File>
+            <File>
+              <FileName>RegisterMap.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Hardware\RegisterMap.h</FilePath>
+            </File>
+            <File>
+              <FileName>SPI_Proto.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Hardware\SPI_Proto.c</FilePath>
+            </File>
+            <File>
+              <FileName>SPI_Proto.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Hardware\SPI_Proto.h</FilePath>
+            </File>
+            <File>
+              <FileName>SPI_SlaveLink.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Hardware\SPI_SlaveLink.c</FilePath>
+            </File>
+            <File>
+              <FileName>SPI_SlaveLink.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Hardware\SPI_SlaveLink.h</FilePath>
             </File>
           </Files>
         </Group>
@@ -754,6 +774,16 @@
               <FileName>stm32f10x_it.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\User\stm32f10x_it.h</FilePath>
+            </File>
+            <File>
+              <FileName>raindrop.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\User\raindrop.c</FilePath>
+            </File>
+            <File>
+              <FileName>raindrop.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\User\raindrop.h</FilePath>
             </File>
           </Files>
         </Group>

@@ -1,0 +1,14 @@
+; *************************************************************
+; *** Scatter-Loading Description File ***
+; *************************************************************
+
+LR_IROM1 0x08000000 0x00010000  {    ; 64KB Flash
+  ER_IROM1 0x08000000 0x00010000  {  ; 64KB Flash
+   *.o (RESET, +First)
+   *(InRoot$$Sections)
+   .ANY (+RO)
+  }
+  RW_IRAM1 0x20000000 0x00010000  {  ; 64KB SRAM
+   .ANY (+RW +ZI)
+  }
+}
