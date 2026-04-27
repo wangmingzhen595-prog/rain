@@ -13,9 +13,15 @@ static void Fill_Window_Centered(volatile uint16_t *ring_buf, uint16_t ring_idx,
 static void Haar_DWT_Step(int16_t *input, uint16_t even_len, int16_t *approx, int16_t *detail);
 static uint32_t Compute_Energy_SumSquares(int16_t *coeffs, uint16_t n);
 static void Extract_Energy(WaveletEnergyCtx_t *ctx, int16_t *window);
+static uint32_t Compute_RawSamples_FromUs(WaveletEnergyCtx_t *ctx, uint32_t duration_us);
 static uint32_t Compute_Deadtime_RawSamples(WaveletEnergyCtx_t *ctx);
+static int16_t Clip_To_Int16(int32_t value);
+static uint16_t Abs_I16(int16_t value);
+static uint8_t Event_IsActiveSample(int16_t sample);
 static void EventEnvelope_Reset(WaveletEnergyCtx_t *ctx);
-static void EventEnvelope_Update(WaveletEnergyCtx_t *ctx, WE_EventType_t candidate_type);
+static void EventSnapshot_Start(WaveletEnergyCtx_t *ctx, volatile uint16_t *ring_buf, uint16_t ring_idx, int32_t dc_baseline);
+static void EventSnapshot_Append(WaveletEnergyCtx_t *ctx, int16_t sample, uint16_t raw_step);
+static void EventSnapshot_Analyze(WaveletEnergyCtx_t *ctx);
 static void EventEnvelope_Finalize(WaveletEnergyCtx_t *ctx);
 
 static uint32_t Saturate_U64_To_U32(uint64_t value)
@@ -25,13 +31,13 @@ static uint32_t Saturate_U64_To_U32(uint64_t value)
     return (uint32_t)value;
 }
 
-static uint32_t Compute_Deadtime_RawSamples(WaveletEnergyCtx_t *ctx)
+static uint32_t Compute_RawSamples_FromUs(WaveletEnergyCtx_t *ctx, uint32_t duration_us)
 {
     uint32_t sample_rate = ctx->actual_sample_rate_hz;
     if (sample_rate == 0)
         sample_rate = 23810U;
 
-    uint64_t samples = ((uint64_t)sample_rate * WE_INTEGRAL_DEADTIME_US + 999999ULL) / 1000000ULL;
+    uint64_t samples = ((uint64_t)sample_rate * duration_us + 999999ULL) / 1000000ULL;
     if (samples < 1)
         samples = 1;
     if (samples > 0xFFFFFFFFULL)
@@ -39,11 +45,39 @@ static uint32_t Compute_Deadtime_RawSamples(WaveletEnergyCtx_t *ctx)
     return (uint32_t)samples;
 }
 
+static uint32_t Compute_Deadtime_RawSamples(WaveletEnergyCtx_t *ctx)
+{
+    return Compute_RawSamples_FromUs(ctx, WE_INTEGRAL_DEADTIME_US);
+}
+
+static int16_t Clip_To_Int16(int32_t value)
+{
+    if (value > 32767) return 32767;
+    if (value < -32768) return -32768;
+    return (int16_t)value;
+}
+
+static uint16_t Abs_I16(int16_t value)
+{
+    return (value < 0) ? (uint16_t)(-value) : (uint16_t)value;
+}
+
+static uint8_t Event_IsActiveSample(int16_t sample)
+{
+    return (Abs_I16(sample) >= WE_SIGNAL_MIN_ADC) ? 1 : 0;
+}
+
 static void EventEnvelope_Reset(WaveletEnergyCtx_t *ctx)
 {
     ctx->event_active = 0;
     ctx->event_gap_windows = 0;
     ctx->event_window_count = 0;
+    ctx->event_gap_raw_samples = 0;
+    ctx->event_raw_samples = 0;
+    ctx->event_impulse_sum = 0.0f;
+    ctx->event_sample_count = 0;
+    ctx->event_effective_start = 0;
+    ctx->event_effective_end = 0;
     ctx->event_acc_type = WE_EVENT_NONE;
     ctx->event_peak_impulse = 0.0f;
     ctx->event_peak_energy = 0;
@@ -52,57 +86,113 @@ static void EventEnvelope_Reset(WaveletEnergyCtx_t *ctx)
     ctx->event_hf_ratio = 0;
 }
 
-static void EventEnvelope_Update(WaveletEnergyCtx_t *ctx, WE_EventType_t candidate_type)
+static void EventSnapshot_Start(WaveletEnergyCtx_t *ctx, volatile uint16_t *ring_buf, uint16_t ring_idx, int32_t dc_baseline)
 {
-    uint32_t norm = 0;
+    uint16_t pre = (WE_PRE_TRIGGER_SAMPLES > WE_EVENT_BUFFER_SIZE) ? WE_EVENT_BUFFER_SIZE : WE_PRE_TRIGGER_SAMPLES;
 
-    if (!ctx->event_active)
+    EventEnvelope_Reset(ctx);
+    ctx->event_active = 1;
+    ctx->event_acc_type = WE_EVENT_RAIN;
+    ctx->event_hf_ratio = ctx->hf_ratio;
+
+    for (uint16_t i = 0; i < pre; i++)
     {
-        ctx->event_active = 1;
-        ctx->event_gap_windows = 0;
-        ctx->event_window_count = 0;
-        ctx->event_acc_type = candidate_type;
-        ctx->event_peak_impulse = 0.0f;
-        ctx->event_peak_energy = 0;
-        ctx->event_peak_delta = 0;
-        ctx->event_peak_norm_ratio = 0;
-        ctx->event_hf_ratio = ctx->hf_ratio;
+        uint16_t idx = (uint16_t)((ring_idx + RING_BUFFER_SIZE - pre + i) % RING_BUFFER_SIZE);
+        ctx->event_buffer[i] = Clip_To_Int16((int32_t)ring_buf[idx] - dc_baseline);
     }
 
-    if (candidate_type == WE_EVENT_VIB)
-        ctx->event_acc_type = WE_EVENT_VIB;
+    ctx->event_sample_count = pre;
+    ctx->event_raw_samples = pre;
+    ctx->event_gap_raw_samples = 0;
+}
 
-    ctx->event_gap_windows = 0;
-    if (ctx->event_window_count < 255)
-        ctx->event_window_count++;
+static void EventSnapshot_Append(WaveletEnergyCtx_t *ctx, int16_t sample, uint16_t raw_step)
+{
+    if (ctx->event_sample_count < WE_EVENT_BUFFER_SIZE)
+    {
+        ctx->event_buffer[ctx->event_sample_count++] = sample;
+    }
 
-    if (ctx->impulse_current > ctx->event_peak_impulse)
-        ctx->event_peak_impulse = ctx->impulse_current;
+    ctx->event_raw_samples += raw_step;
 
-    if (ctx->energy_high > ctx->event_peak_energy)
-        ctx->event_peak_energy = ctx->energy_high;
+    if (Event_IsActiveSample(sample))
+        ctx->event_gap_raw_samples = 0;
+        ctx->event_gap_raw_samples += raw_step;
 
-    if (ctx->energy_delta > ctx->event_peak_delta)
-        ctx->event_peak_delta = ctx->energy_delta;
+    if (ctx->event_gap_raw_samples >= Compute_RawSamples_FromUs(ctx, WE_EVENT_GAP_US) ||
+        ctx->event_raw_samples >= Compute_RawSamples_FromUs(ctx, WE_EVENT_MAX_DURATION_US) ||
+        ctx->event_sample_count >= WE_EVENT_BUFFER_SIZE)
+    {
+        EventEnvelope_Finalize(ctx);
+    }
+}
+
+static void EventSnapshot_Analyze(WaveletEnergyCtx_t *ctx)
+{
+    uint16_t count = ctx->event_sample_count;
+    uint16_t start = 0;
+    uint16_t end = 0;
+    uint16_t peak_idx = 0;
+    int16_t peak = 0;
+    float impulse = 0.0f;
+    int16_t wave_window[WE_WINDOW_SIZE];
+
+    if (count == 0)
+        return;
+
+    while (start < count && !Event_IsActiveSample(ctx->event_buffer[start]))
+        start++;
+    if (start >= count)
+        start = 0;
+
+    end = count - 1;
+    while (end > start && !Event_IsActiveSample(ctx->event_buffer[end]))
+        end--;
+
+    for (uint16_t i = start; i <= end && i < count; i++)
+    {
+        int16_t sample = ctx->event_buffer[i];
+        if (sample > peak)
+        {
+            peak = sample;
+            peak_idx = i;
+        }
+        if (sample > (int16_t)WE_SIGNAL_MIN_ADC)
+            impulse += (float)(sample - (int16_t)WE_SIGNAL_MIN_ADC);
+    }
+
+    {
+        uint16_t base = 0;
+        if (count > WE_WINDOW_SIZE)
+        {
+            if (peak_idx > (WE_WINDOW_SIZE / 2))
+                base = (uint16_t)(peak_idx - (WE_WINDOW_SIZE / 2));
+            if ((uint16_t)(base + WE_WINDOW_SIZE) > count)
+                base = (uint16_t)(count - WE_WINDOW_SIZE);
+        }
+
+        for (uint16_t i = 0; i < WE_WINDOW_SIZE; i++)
+        {
+            uint16_t src = (uint16_t)(base + i);
+            wave_window[i] = (src < count) ? ctx->event_buffer[src] : 0;
+        }
+    }
+
+    Extract_Energy(ctx, wave_window);
+    ctx->energy_delta = (ctx->energy_high >= ctx->baseline_energy) ? (ctx->energy_high - ctx->baseline_energy) : 0;
+    ctx->event_peak_energy = ctx->energy_high;
+    ctx->event_peak_delta = ctx->energy_delta;
+    ctx->event_hf_ratio = ctx->hf_ratio;
+    ctx->event_peak_impulse = (float)peak;
+    ctx->event_impulse_sum = impulse;
+    ctx->event_effective_start = start;
+    ctx->event_effective_end = end;
+    ctx->last_event_raw_samples = (uint32_t)(end - start + 1);
 
     if (ctx->baseline_energy > 0 && ctx->energy_high >= ctx->baseline_energy)
-        norm = (uint32_t)(((uint64_t)(ctx->energy_high - ctx->baseline_energy) * 1000ULL) / ctx->baseline_energy);
-    if (norm > ctx->event_peak_norm_ratio)
-        ctx->event_peak_norm_ratio = norm;
-
-    if (ctx->event_acc_type == WE_EVENT_RAIN)
-    {
-        if (ctx->event_hf_ratio == 0 || ctx->hf_ratio < ctx->event_hf_ratio)
-            ctx->event_hf_ratio = ctx->hf_ratio;
-    }
+        ctx->event_peak_norm_ratio = (uint32_t)(((uint64_t)(ctx->energy_high - ctx->baseline_energy) * 1000ULL) / ctx->baseline_energy);
     else
-    {
-        if (ctx->hf_ratio > ctx->event_hf_ratio)
-            ctx->event_hf_ratio = ctx->hf_ratio;
-    }
-
-    if (ctx->event_window_count >= WE_EVENT_MAX_WINDOWS)
-        EventEnvelope_Finalize(ctx);
+        ctx->event_peak_norm_ratio = 0;
 }
 
 static void EventEnvelope_Finalize(WaveletEnergyCtx_t *ctx)
@@ -110,29 +200,17 @@ static void EventEnvelope_Finalize(WaveletEnergyCtx_t *ctx)
     if (!ctx->event_active)
         return;
 
-    ctx->impulse_rain = ctx->event_peak_impulse;
+    EventSnapshot_Analyze(ctx);
+    ctx->impulse_rain = ctx->event_impulse_sum;
     ctx->energy_high = ctx->event_peak_energy;
     ctx->energy_delta = ctx->event_peak_delta;
     ctx->norm_ratio = ctx->event_peak_norm_ratio;
     ctx->hf_ratio = ctx->event_hf_ratio;
-    ctx->event_type = ctx->event_acc_type;
+    ctx->event_type = WE_EVENT_RAIN;
 
     ctx->total_events++;
-    if (ctx->event_acc_type == WE_EVENT_RAIN)
-    {
-        ctx->rain_count++;
-        ctx->rain_event_pending = 1;
-    }
-    else if (ctx->event_acc_type == WE_EVENT_VIB)
-    {
-        ctx->vib_count++;
-        ctx->vib_event_pending = 1;
-    }
-    else
-    {
-        ctx->noise_count++;
-        ctx->noise_event_pending = 1;
-    }
+    ctx->rain_count++;
+    ctx->rain_event_pending = 1;
 
     ctx->deadtime_raw_remaining = Compute_Deadtime_RawSamples(ctx);
     EventEnvelope_Reset(ctx);
@@ -174,10 +252,7 @@ static void Fill_Window_Centered(volatile uint16_t *ring_buf, uint16_t ring_idx,
     for (int16_t i = WE_WINDOW_SIZE - 1; i >= 0; i--)
     {
         uint16_t idx = (ring_idx + RING_BUFFER_SIZE - 1 - i) % RING_BUFFER_SIZE;
-        int32_t diff = (int32_t)ring_buf[idx] - dc_baseline;
-        if (diff >  32767) diff =  32767;
-        if (diff < -32768) diff = -32768;
-        window[i] = (int16_t)diff;
+        window[i] = Clip_To_Int16((int32_t)ring_buf[idx] - dc_baseline);
     }
 }
 
@@ -409,12 +484,17 @@ void WaveletEnergy_Update(WaveletEnergyCtx_t *ctx,
         ctx->energy_delta = 0;
 
     /* 冲量计算：I = Σ max(0, signal[i]) × Ts（去直流后信号，正值积分） */
-    ctx->impulse_current = 0.0f;
-    for (uint16_t i = 0; i < WE_WINDOW_SIZE; i++)
-    {
-        if (window[i] > 0)
-            ctx->impulse_current += (float)window[i];
-    }
+    /* Calibration impulse contribution: integrate wavelet energy above baseline. */
+    uint16_t latest_idx = (ring_idx == 0) ? (RING_BUFFER_SIZE - 1) : (ring_idx - 1);
+    uint16_t latest_raw = ring_buf[latest_idx];
+    int16_t latest_signal = window[WE_WINDOW_SIZE - 1];
+    uint8_t raw_trigger = 0;
+
+    ctx->impulse_current = (latest_signal > 0) ? (float)latest_signal : 0.0f;
+    if (latest_signal >= (int16_t)WE_TRIGGER_DELTA_ADC)
+        raw_trigger = 1;
+    if (latest_raw >= ADC_Threshold && latest_signal >= (int16_t)WE_SIGNAL_MIN_ADC)
+        raw_trigger = 1;
 
     /* 基线慢速跟踪（长时间无事件时轻微调整） */
     if (ctx->baseline_count > 1000 && ctx->energy_high < ctx->baseline_energy)
@@ -429,42 +509,16 @@ void WaveletEnergy_Update(WaveletEnergyCtx_t *ctx,
 
     /* 事件分类 */
     ctx->event_type = WE_EVENT_NONE;
-    if (ctx->energy_delta < WE_MIN_ENERGY_DELTA)
+    if (!ctx->event_active)
     {
-        if (ctx->event_active)
+        if (raw_trigger)
         {
-            ctx->event_gap_windows++;
-            if (ctx->event_gap_windows >= WE_EVENT_GAP_WINDOWS)
-                EventEnvelope_Finalize(ctx);
+            EventSnapshot_Start(ctx, ring_buf, ring_idx, dc_baseline);
         }
         return;
     }
-    else if (ctx->energy_high < ctx->threshold_energy)
-    {
-        if (ctx->event_active)
-        {
-            ctx->event_gap_windows++;
-            if (ctx->event_gap_windows >= WE_EVENT_GAP_WINDOWS)
-                EventEnvelope_Finalize(ctx);
-        }
-        return;
-    }
-    else if (ctx->hf_ratio >= WE_HF_VIB_MIN)
-    {
-        ctx->event_type = WE_EVENT_VIB;
-        EventEnvelope_Update(ctx, WE_EVENT_VIB);
-    }
-    else if (ctx->hf_ratio <= WE_HF_RAIN_MAX)
-    {
-        ctx->event_type = WE_EVENT_RAIN;
-        EventEnvelope_Update(ctx, WE_EVENT_RAIN);
-    }
-    else
-    {
-        /* 中间区域：保守处理为振动 */
-        ctx->event_type = WE_EVENT_VIB;
-        EventEnvelope_Update(ctx, WE_EVENT_VIB);
-    }
+    EventSnapshot_Append(ctx, latest_signal, raw_step);
+    return;
 }
 
 /* ===================== 辅助函数 ===================== */
@@ -581,8 +635,12 @@ uint32_t WaveletEnergy_ProcessNewSamples(WaveletEnergyCtx_t *ctx)
 
     /* 降采样：样本过多时每隔 N 个取 1 个，防止主循环阻塞 */
     uint16_t step = 1;
+#if WE_CALIBRATION_MODE
+    step = 1;
+#else
     if (available > WE_DOWNSAMPLE_THRESHOLD)
         step = WE_DOWNSAMPLE_FACTOR;
+#endif
     ctx->process_decimation = step;
 
     /* 逐个处理（降采样后） */

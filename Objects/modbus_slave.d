@@ -2,7 +2,7 @@
 .\objects\modbus_slave.o: Hardware\Modbus_Slave.h
 .\objects\modbus_slave.o: .\Start\stm32f10x.h
 .\objects\modbus_slave.o: .\Start\core_cm3.h
-.\objects\modbus_slave.o: D:\Keil5\ARM\ARMCC\Bin\..\include\stdint.h
+.\objects\modbus_slave.o: D:\stm32\keil5\ARM\ARMCC\Bin\..\include\stdint.h
 .\objects\modbus_slave.o: .\Start\system_stm32f10x.h
 .\objects\modbus_slave.o: .\User\stm32f10x_conf.h
 .\objects\modbus_slave.o: .\Library\stm32f10x_adc.h

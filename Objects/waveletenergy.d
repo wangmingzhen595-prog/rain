@@ -2,7 +2,7 @@
 .\objects\waveletenergy.o: Hardware\WaveletEnergy.h
 .\objects\waveletenergy.o: .\Start\stm32f10x.h
 .\objects\waveletenergy.o: .\Start\core_cm3.h
-.\objects\waveletenergy.o: D:\Keil5\ARM\ARMCC\Bin\..\include\stdint.h
+.\objects\waveletenergy.o: D:\stm32\keil5\ARM\ARMCC\Bin\..\include\stdint.h
 .\objects\waveletenergy.o: .\Start\system_stm32f10x.h
 .\objects\waveletenergy.o: .\User\stm32f10x_conf.h
 .\objects\waveletenergy.o: .\Library\stm32f10x_adc.h
@@ -30,4 +30,4 @@
 .\objects\waveletenergy.o: .\Library\stm32f10x_wwdg.h
 .\objects\waveletenergy.o: .\Library\misc.h
 .\objects\waveletenergy.o: Hardware\AD.h
-.\objects\waveletenergy.o: D:\Keil5\ARM\ARMCC\Bin\..\include\string.h
+.\objects\waveletenergy.o: D:\stm32\keil5\ARM\ARMCC\Bin\..\include\string.h

@@ -2,7 +2,7 @@
 .\objects\registermap.o: Hardware\RegisterMap.h
 .\objects\registermap.o: .\Start\stm32f10x.h
 .\objects\registermap.o: .\Start\core_cm3.h
-.\objects\registermap.o: D:\Keil5\ARM\ARMCC\Bin\..\include\stdint.h
+.\objects\registermap.o: D:\stm32\keil5\ARM\ARMCC\Bin\..\include\stdint.h
 .\objects\registermap.o: .\Start\system_stm32f10x.h
 .\objects\registermap.o: .\User\stm32f10x_conf.h
 .\objects\registermap.o: .\Library\stm32f10x_adc.h

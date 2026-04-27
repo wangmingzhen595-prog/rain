@@ -2,7 +2,7 @@
 .\objects\spi_slavelink.o: Hardware\SPI_SlaveLink.h
 .\objects\spi_slavelink.o: .\Start\stm32f10x.h
 .\objects\spi_slavelink.o: .\Start\core_cm3.h
-.\objects\spi_slavelink.o: D:\Keil5\ARM\ARMCC\Bin\..\include\stdint.h
+.\objects\spi_slavelink.o: D:\stm32\keil5\ARM\ARMCC\Bin\..\include\stdint.h
 .\objects\spi_slavelink.o: .\Start\system_stm32f10x.h
 .\objects\spi_slavelink.o: .\User\stm32f10x_conf.h
 .\objects\spi_slavelink.o: .\Library\stm32f10x_adc.h

@@ -60,6 +60,7 @@ typedef struct {
     uint32_t nr;           /* 归一化比值（×1000permille） */
     uint16_t hf;           /* 高频比例（permille） */
     float    impulse;      /* 冲量（ADC·次） */
+    uint32_t event_samples; /* Event width in raw samples. */
     uint32_t dE;           /* 能量增量 */
     uint32_t time_ms;      /* 时间戳（ms） */
 } CalDropRecord_t;
@@ -90,6 +91,8 @@ static void USART1_SendFloat_WithTail(float v);
 static void USART1_SendString(const char *str);
 static void USART1_SendUint32(uint32_t val);
 static void USART1_SendInt32(int32_t val);
+static uint32_t Float_To_U32_Clamp(float v, uint32_t max_val);
+static uint32_t Samples_To_Ms(uint32_t samples);
 static void Send_Live_Stream(void);
 static void Send_Debug_Statistics(void);
 static float Compute_Intensity_MMH(void);
@@ -99,6 +102,7 @@ void Check_System_Status(void);
 /* 标定相关 */
 static void CAL_ProcessCommand(const char *cmd, uint8_t len);
 static void CAL_UpdateDisplay(void);
+static void CAL_PrintADCStatus(void);
 static void CAL_RecordDrop(uint32_t nr, uint16_t hf, float impulse, uint32_t dE);
 void WE_Calibration_EventCallback(
     WE_EventType_t ev_type,
@@ -465,6 +469,23 @@ static void USART1_SendUint32(uint32_t val)
     USART1_SendString(num_str);
 }
 
+static uint32_t Float_To_U32_Clamp(float v, uint32_t max_val)
+{
+    if (v <= 0.0f)
+        return 0;
+    if (v >= (float)max_val)
+        return max_val;
+    return (uint32_t)(v + 0.5f);
+}
+
+static uint32_t Samples_To_Ms(uint32_t samples)
+{
+    uint32_t sample_rate = g_we_ctx.actual_sample_rate_hz;
+    if (sample_rate == 0)
+        sample_rate = 23810U;
+    return (uint32_t)(((uint64_t)samples * 1000ULL + sample_rate / 2U) / sample_rate);
+}
+
 static void USART1_SendFloat_WithTail(float v)
 {
     const uint8_t jf_tail[4] = {0x00, 0x00, 0x80, 0x7F};
@@ -537,6 +558,11 @@ static void Send_Debug_Statistics(void)
     USART1_SendString("norm_ratio=");
     USART1_SendUint32(WaveletEnergy_GetNormRatio(&g_we_ctx));
     USART1_SendString(" permille\r\n");
+    USART1_SendString("last_impulse=");
+    USART1_SendUint32(Float_To_U32_Clamp(g_we_ctx.impulse_rain, 0xFFFFFFFFU));
+    USART1_SendString(" width_ms=");
+    USART1_SendUint32(Samples_To_Ms(g_we_ctx.last_event_raw_samples));
+    USART1_SendString("\r\n");
     /* 统计（未标定） */
     USART1_SendString("rain_cnt=");
     USART1_SendUint32(g_we_ctx.rain_count);
@@ -619,6 +645,7 @@ static void CAL_RecordDrop(uint32_t nr, uint16_t hf, float impulse, uint32_t dE)
     g_cal_records[idx].nr          = nr;
     g_cal_records[idx].hf          = hf;
     g_cal_records[idx].impulse     = impulse;
+    g_cal_records[idx].event_samples = g_we_ctx.last_event_raw_samples;
     g_cal_records[idx].dE         = dE;
     g_cal_records[idx].time_ms    = g_sys_time_ms;
 
@@ -641,13 +668,9 @@ static void CAL_RecordDrop(uint32_t nr, uint16_t hf, float impulse, uint32_t dE)
     USART1_SendString(" hf=");
     USART1_SendUint32(hf);
     USART1_SendString(" imp=");
-    int32_t imp_i = (int32_t)(impulse * 100.0f);
-    if (imp_i < 0) { USART1_SendByte('-'); imp_i = -imp_i; }
-    USART1_SendInt32(imp_i / 100);
-    USART1_SendByte('.');
-    int32_t imp_f = imp_i % 100;
-    if (imp_f < 10) USART1_SendByte('0');
-    USART1_SendInt32(imp_f);
+    USART1_SendUint32(Float_To_U32_Clamp(impulse, 0xFFFFFFFFU));
+    USART1_SendString(" width_ms=");
+    USART1_SendUint32(Samples_To_Ms(g_we_ctx.last_event_raw_samples));
     USART1_SendString(" dE=");
     USART1_SendUint32(dE);
     USART1_SendString("\r\n");
@@ -668,9 +691,54 @@ static void CAL_RecordDrop(uint32_t nr, uint16_t hf, float impulse, uint32_t dE)
   *   STREAM ON/OFF - 打开/关闭USART1实时波形输出
   *   HELP       - 输出命令帮助
   */
+static void CAL_PrintADCStatus(void)
+{
+    extern volatile uint16_t adc_ring_buffer_ch0[RING_BUFFER_SIZE];
+    extern volatile uint16_t ring_write_index_ch0;
+    extern volatile uint32_t ring_write_total_ch0;
+
+    uint16_t write_idx = ring_write_index_ch0;
+    uint16_t latest_idx = (write_idx == 0) ? (RING_BUFFER_SIZE - 1) : (write_idx - 1);
+    uint16_t latest = adc_ring_buffer_ch0[latest_idx];
+    uint16_t min_v = 0xFFFFU;
+    uint16_t max_v = 0;
+    uint32_t sum = 0;
+
+    for (uint16_t i = 0; i < 64; i++)
+    {
+        uint16_t idx = (uint16_t)((write_idx + RING_BUFFER_SIZE - 1 - i) % RING_BUFFER_SIZE);
+        uint16_t v = adc_ring_buffer_ch0[idx];
+        if (v < min_v) min_v = v;
+        if (v > max_v) max_v = v;
+        sum += v;
+    }
+
+    USART1_SendString("[ADC] samples=");
+    USART1_SendUint32(ring_write_total_ch0);
+    USART1_SendString(" latest=");
+    USART1_SendUint32(latest);
+    USART1_SendString(" min64=");
+    USART1_SendUint32(min_v);
+    USART1_SendString(" max64=");
+    USART1_SendUint32(max_v);
+    USART1_SendString(" avg64=");
+    USART1_SendUint32(sum / 64U);
+    USART1_SendString(" learn=");
+    USART1_SendUint32(WaveletEnergy_GetLearningProgress(&g_we_ctx));
+    USART1_SendString("% done=");
+    USART1_SendString(g_we_ctx.learning_done ? "Y" : "N");
+    USART1_SendString("\r\n");
+}
+
 static void CAL_ProcessCommand(const char *cmd, uint8_t len)
 {
     if (len == 0) return;
+
+    if (strncmp(cmd, "adc", len) == 0)
+    {
+        CAL_PrintADCStatus();
+        return;
+    }
 
     /* SETN name：设置针头名称并新建分组 */
     if (len >= 5 && strncmp(cmd, "setn ", 5) == 0)
@@ -714,13 +782,9 @@ static void CAL_ProcessCommand(const char *cmd, uint8_t len)
             USART1_SendString("last_nr=");
             USART1_SendUint32(g_we_ctx.norm_ratio);
             USART1_SendString("\r\nlast_imp=");
-            int32_t imp_i = (int32_t)(g_we_ctx.impulse_rain * 100.0f);
-            if (imp_i < 0) { USART1_SendByte('-'); imp_i = -imp_i; }
-            USART1_SendInt32(imp_i / 100);
-            USART1_SendByte('.');
-            int32_t imp_f = imp_i % 100;
-            if (imp_f < 10) USART1_SendByte('0');
-            USART1_SendInt32(imp_f);
+            USART1_SendUint32(Float_To_U32_Clamp(g_we_ctx.impulse_rain, 0xFFFFFFFFU));
+            USART1_SendString("\r\nlast_width_ms=");
+            USART1_SendUint32(Samples_To_Ms(g_we_ctx.last_event_raw_samples));
             USART1_SendString("\r\n");
         }
         USART1_SendString("sys_time=");
@@ -745,7 +809,7 @@ static void CAL_ProcessCommand(const char *cmd, uint8_t len)
     if (strncmp(cmd, "export", len) == 0)
     {
         USART1_SendString("[CAL] === EXPORT START ===\r\n");
-        USART1_SendString("# group    seq    nr      hf     impulse      dE       time_ms\r\n");
+        USART1_SendString("# group    seq    impulse      width_ms   nr      hf     dE       time_ms\r\n");
         for (uint16_t i = 0; i < g_cal_record_count; i++)
         {
             CalDropRecord_t *r = &g_cal_records[i];
@@ -762,23 +826,17 @@ static void CAL_ProcessCommand(const char *cmd, uint8_t len)
             if (r->seq_in_group < 10)  USART1_SendByte(' ');
             USART1_SendUint32(r->seq_in_group);
             USART1_SendString("   ");
+            /* impulse */
+            USART1_SendUint32(Float_To_U32_Clamp(r->impulse, 0xFFFFFFFFU));
+            USART1_SendString("     ");
+            /* width_ms */
+            USART1_SendUint32(Samples_To_Ms(r->event_samples));
+            USART1_SendString("     ");
             /* nr */
             USART1_SendUint32(r->nr);
             USART1_SendString("    ");
             /* hf */
             USART1_SendUint32(r->hf);
-            USART1_SendString("    ");
-            /* impulse */
-            int32_t imp_i = (int32_t)(r->impulse * 100.0f);
-            if (imp_i < 0) { USART1_SendByte('-'); imp_i = -imp_i; }
-            if (imp_i / 100000) USART1_SendByte('0' + (imp_i / 100000) % 10);
-            if (imp_i / 10000)  USART1_SendByte('0' + (imp_i / 10000) % 10);
-            if (imp_i / 1000)   USART1_SendByte('0' + (imp_i / 1000) % 10);
-            USART1_SendByte('.');
-            int32_t imp_f = imp_i % 1000;
-            if (imp_f < 100) USART1_SendByte('0');
-            if (imp_f < 10)  USART1_SendByte('0');
-            USART1_SendInt32(imp_f);
             USART1_SendString("     ");
             /* dE */
             USART1_SendUint32(r->dE);
@@ -829,6 +887,7 @@ static void CAL_ProcessCommand(const char *cmd, uint8_t len)
     {
         USART1_SendString("[CAL] === Commands ===\r\n");
         USART1_SendString("SETN name - set needle name\r\n");
+        USART1_SendString("ADC       - show raw ADC status\r\n");
         USART1_SendString("STAT      - show stats\r\n");
         USART1_SendString("EXPORT    - dump all data\r\n");
         USART1_SendString("RESET     - clear all\r\n");
@@ -862,44 +921,55 @@ static void CAL_UpdateDisplay(void)
     for (uint8_t s = 0; s < 8 - nl; s++) OLED_ShowChar(1, 2 + s, ' ');
     OLED_ShowString(1, 10 - nl, g_cal_group_name);
     OLED_ShowString(1, 10, "]");
-    uint32_t gc = g_cal_group_drop_count;
-    if (gc > 99) gc = 99;
-    if (gc > 9) OLED_ShowNum(1, 12, gc, 2);
-    else        { OLED_ShowChar(1, 12, ' '); OLED_ShowNum(1, 13, gc, 1); }
-    OLED_ShowString(1, 15, " ");
-
-    /* 行2：nr + hf */
-    OLED_ShowString(2, 1, "nr:");
-    uint32_t nr = g_we_ctx.norm_ratio;
-    if (nr > 9999) nr = 9999;
-    OLED_ShowNum(2, 4, nr, 4);
-    OLED_ShowString(2, 9, "hf:");
-    uint32_t hf = g_we_ctx.hf_ratio;
-    if (hf > 999) hf = 999;
-    OLED_ShowNum(2, 12, hf, 3);
-
-    /* 行3：总雨滴检测数 */
-    OLED_ShowString(3, 1, "cnt:");
-    uint32_t rc = g_cal_detected_count;
-    if (rc > 9999) rc = 9999;
-    OLED_ShowNum(3, 5, rc, 4);
-    OLED_ShowString(3, 10, "    ");
-
-    /* 行4：总记录数 */
-    OLED_ShowString(4, 1, "tot:");
-    uint32_t tot = g_cal_record_count;
-    if (tot > 9999) tot = 9999;
-    OLED_ShowNum(4, 5, tot, 4);
-    OLED_ShowString(4, 10, "    ");
-
-    /* 如果正在学习，显示进度（覆盖行1右侧） */
     if (!g_we_ctx.learning_done)
     {
         uint8_t prog = WaveletEnergy_GetLearningProgress(&g_we_ctx);
-        OLED_ShowString(1, 10, "L");
-        OLED_ShowNum(1, 11, prog, 3);
-        OLED_ShowChar(1, 14, '%');
-        OLED_ShowChar(1, 15, ' ');
+        OLED_ShowChar(1, 11, 'L');
+        OLED_ShowNum(1, 12, prog, 3);
+        OLED_ShowChar(1, 15, '%');
+        OLED_ShowChar(1, 16, ' ');
     }
+    else
+    {
+        uint32_t gc = g_cal_group_drop_count;
+        if (gc > 99) gc = 99;
+        OLED_ShowChar(1, 11, ' ');
+        if (gc > 9) OLED_ShowNum(1, 12, gc, 2);
+        else        { OLED_ShowChar(1, 12, ' '); OLED_ShowNum(1, 13, gc, 1); }
+        OLED_ShowChar(1, 14, ' ');
+        OLED_ShowChar(1, 15, ' ');
+        OLED_ShowChar(1, 16, ' ');
+    }
+
+    /* 行2：nr + hf */
+    OLED_ShowString(2, 1, "IMP:");
+    uint32_t imp = Float_To_U32_Clamp(g_we_ctx.impulse_rain, 99999999U);
+    OLED_ShowNum(2, 5, imp, 8);
+    OLED_ShowString(2, 13, "    ");
+
+    /* 行3：总雨滴检测数 */
+    OLED_ShowString(3, 1, "W:");
+    uint32_t width_ms = Samples_To_Ms(g_we_ctx.last_event_raw_samples);
+    if (width_ms > 9999) width_ms = 9999;
+    OLED_ShowNum(3, 3, width_ms, 4);
+    OLED_ShowString(3, 7, "ms");
+    OLED_ShowString(3, 10, "N:");
+    uint32_t rc = g_cal_detected_count;
+    if (rc > 999) rc = 999;
+    OLED_ShowNum(3, 12, rc, 3);
+    OLED_ShowChar(3, 15, ' ');
+    OLED_ShowChar(3, 16, ' ');
+
+    /* 行4：总记录数 */
+    OLED_ShowString(4, 1, "E:");
+    uint32_t de = g_we_ctx.energy_delta;
+    if (de > 99999) de = 99999;
+    OLED_ShowNum(4, 3, de, 5);
+    OLED_ShowString(4, 9, "T:");
+    uint32_t thr = g_we_ctx.threshold_energy;
+    if (thr > 99999) thr = 99999;
+    OLED_ShowNum(4, 11, thr, 5);
+
+    /* 如果正在学习，显示进度（覆盖行1右侧） */
 }
 

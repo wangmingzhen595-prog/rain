@@ -2,7 +2,7 @@
 .\objects\tf_comm.o: Hardware\TF_Comm.h
 .\objects\tf_comm.o: .\Start\stm32f10x.h
 .\objects\tf_comm.o: .\Start\core_cm3.h
-.\objects\tf_comm.o: D:\Keil5\ARM\ARMCC\Bin\..\include\stdint.h
+.\objects\tf_comm.o: D:\stm32\keil5\ARM\ARMCC\Bin\..\include\stdint.h
 .\objects\tf_comm.o: .\Start\system_stm32f10x.h
 .\objects\tf_comm.o: .\User\stm32f10x_conf.h
 .\objects\tf_comm.o: .\Library\stm32f10x_adc.h

@@ -29,8 +29,13 @@
 #define WE_INTEGRAL_DEADTIME_US 2500U
 
 /* 多窗口事件包络参数：连续窗口内累计峰值，短暂跌落允许继续归为同一事件。 */
-#define WE_EVENT_MAX_WINDOWS    8
-#define WE_EVENT_GAP_WINDOWS    2
+/* Event integration timing for calibration impulse feature. */
+#define WE_EVENT_MAX_DURATION_US 12000U
+#define WE_EVENT_GAP_US          1000U
+#define WE_PRE_TRIGGER_SAMPLES   96U
+#define WE_EVENT_BUFFER_SIZE     256U
+#define WE_TRIGGER_DELTA_ADC     20U
+#define WE_SIGNAL_MIN_ADC        4U
 
 /* 高频比例阈值（permille，0-1000）：
  * hf_ratio ≤ WE_HF_RAIN_MAX → 雨滴（低频为主）
@@ -123,6 +128,14 @@ typedef struct {
     volatile uint32_t rain_count;
     volatile uint32_t vib_count;
     volatile uint32_t noise_count;
+    float    event_impulse_sum;
+    uint32_t event_gap_raw_samples;
+    uint32_t event_raw_samples;
+    uint32_t last_event_raw_samples;
+    uint16_t event_sample_count;
+    uint16_t event_effective_start;
+    uint16_t event_effective_end;
+    int16_t  event_buffer[WE_EVENT_BUFFER_SIZE];
     volatile uint32_t total_events;
 } WaveletEnergyCtx_t;
 

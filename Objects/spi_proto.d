@@ -2,7 +2,7 @@
 .\objects\spi_proto.o: Hardware\SPI_Proto.h
 .\objects\spi_proto.o: .\Start\stm32f10x.h
 .\objects\spi_proto.o: .\Start\core_cm3.h
-.\objects\spi_proto.o: D:\Keil5\ARM\ARMCC\Bin\..\include\stdint.h
+.\objects\spi_proto.o: D:\stm32\keil5\ARM\ARMCC\Bin\..\include\stdint.h
 .\objects\spi_proto.o: .\Start\system_stm32f10x.h
 .\objects\spi_proto.o: .\User\stm32f10x_conf.h
 .\objects\spi_proto.o: .\Library\stm32f10x_adc.h
