@@ -28,6 +28,7 @@
 ".\objects\delay.o"
 ".\objects\oled.o"
 ".\objects\ad.o"
+".\objects\rainpeaktracker.o"
 ".\objects\tf_comm.o"
 ".\objects\waveletenergy.o"
 ".\objects\modbus_slave.o"

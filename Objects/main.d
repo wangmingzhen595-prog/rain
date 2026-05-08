@@ -35,5 +35,6 @@
 .\objects\main.o: .\Hardware\TF_Comm.h
 .\objects\main.o: .\Hardware\SPI_SlaveLink.h
 .\objects\main.o: .\Hardware\WaveletEnergy.h
+.\objects\main.o: .\Hardware\RainPeakTracker.h
 .\objects\main.o: User\raindrop.h
 .\objects\main.o: D:\stm32\keil5\ARM\ARMCC\Bin\..\include\string.h

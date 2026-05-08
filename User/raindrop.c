@@ -157,6 +157,11 @@ uint32_t Raindrop_VoltageToVolume_0p01mm3(uint32_t U_meas_mV, uint8_t *status_fl
     return (uint32_t)V;
 }
 
+uint32_t Raindrop_PeakMvToVolume_0p01mm3(uint32_t peak_mv, uint8_t *status_flag)
+{
+    return Raindrop_VoltageToVolume_0p01mm3(peak_mv, status_flag);
+}
+
 void Raindrop_ProcessOneDrop(uint16_t adc_peak)
 {
     /* 死区时间检查：如果还在死区内，不处理新事件 */

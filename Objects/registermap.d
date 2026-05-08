@@ -30,3 +30,4 @@
 .\objects\registermap.o: .\Library\stm32f10x_wwdg.h
 .\objects\registermap.o: .\Library\misc.h
 .\objects\registermap.o: Hardware\WaveletEnergy.h
+.\objects\registermap.o: Hardware\RainPeakTracker.h

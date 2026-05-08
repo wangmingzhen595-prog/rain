@@ -13,6 +13,7 @@
 
 /* 开机自学习周期（秒） */
 #define WE_LEARNING_PERIOD_SEC 30
+#define WE_DISABLE_LEARNING     1
 
 /* 检测阈值参数：threshold = baseline + k × std */
 /* k=3 对应 99.7% 置信区间（正态分布） */
@@ -36,6 +37,8 @@
 #define WE_EVENT_BUFFER_SIZE     256U
 #define WE_TRIGGER_DELTA_ADC     20U
 #define WE_SIGNAL_MIN_ADC        4U
+#define WE_EVENT_MIN_ACTIVE_SAMPLES  6U
+#define WE_EVENT_MIN_IMPULSE_SUM     200U
 
 /* 高频比例阈值（permille，0-1000）：
  * hf_ratio ≤ WE_HF_RAIN_MAX → 雨滴（低频为主）

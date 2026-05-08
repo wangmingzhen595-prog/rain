@@ -116,8 +116,13 @@ static void EventSnapshot_Append(WaveletEnergyCtx_t *ctx, int16_t sample, uint16
     ctx->event_raw_samples += raw_step;
 
     if (Event_IsActiveSample(sample))
+    {
         ctx->event_gap_raw_samples = 0;
+    }
+    else
+    {
         ctx->event_gap_raw_samples += raw_step;
+    }
 
     if (ctx->event_gap_raw_samples >= Compute_RawSamples_FromUs(ctx, WE_EVENT_GAP_US) ||
         ctx->event_raw_samples >= Compute_RawSamples_FromUs(ctx, WE_EVENT_MAX_DURATION_US) ||
@@ -135,6 +140,10 @@ static void EventSnapshot_Analyze(WaveletEnergyCtx_t *ctx)
     uint16_t peak_idx = 0;
     int16_t peak = 0;
     float impulse = 0.0f;
+    uint64_t wave_impulse = 0;
+    uint32_t peak_energy = 0;
+    uint16_t peak_hf = 0;
+    uint16_t active_count = 0;
     int16_t wave_window[WE_WINDOW_SIZE];
 
     if (count == 0)
@@ -152,6 +161,8 @@ static void EventSnapshot_Analyze(WaveletEnergyCtx_t *ctx)
     for (uint16_t i = start; i <= end && i < count; i++)
     {
         int16_t sample = ctx->event_buffer[i];
+        if (Event_IsActiveSample(sample))
+            active_count++;
         if (sample > peak)
         {
             peak = sample;
@@ -178,19 +189,56 @@ static void EventSnapshot_Analyze(WaveletEnergyCtx_t *ctx)
         }
     }
 
+    /* Wavelet analysis at peak neighborhood (kept for classification/telemetry). */
     Extract_Energy(ctx, wave_window);
-    ctx->energy_delta = (ctx->energy_high >= ctx->baseline_energy) ? (ctx->energy_high - ctx->baseline_energy) : 0;
-    ctx->event_peak_energy = ctx->energy_high;
+    peak_energy = ctx->energy_high;
+    peak_hf = ctx->hf_ratio;
+    ctx->energy_delta = (peak_energy >= ctx->baseline_energy) ? (peak_energy - ctx->baseline_energy) : 0;
+    ctx->event_peak_energy = peak_energy;
     ctx->event_peak_delta = ctx->energy_delta;
-    ctx->event_hf_ratio = ctx->hf_ratio;
+    ctx->event_hf_ratio = peak_hf;
+
+    /* Wavelet-domain impulse: integrate (energy_high - baseline_energy) over the effective
+     * event range with a coarse stride to keep CPU bounded. Units are "energy-sum". */
+    if (count >= WE_WINDOW_SIZE)
+    {
+        uint16_t stride = 8;
+        uint16_t first = start;
+        uint16_t last = end;
+        if (last + 1 < WE_WINDOW_SIZE)
+        {
+            first = 0;
+            last = (uint16_t)(WE_WINDOW_SIZE - 1);
+        }
+        if (first + WE_WINDOW_SIZE - 1 > last)
+        {
+            first = 0;
+        }
+
+        for (uint16_t base = first; (uint16_t)(base + WE_WINDOW_SIZE) <= (uint16_t)(last + 1) && (uint16_t)(base + WE_WINDOW_SIZE) <= count; base = (uint16_t)(base + stride))
+        {
+            for (uint16_t i = 0; i < WE_WINDOW_SIZE; i++)
+                wave_window[i] = ctx->event_buffer[base + i];
+            Extract_Energy(ctx, wave_window);
+            if (ctx->energy_high > ctx->baseline_energy)
+                wave_impulse += (uint64_t)(ctx->energy_high - ctx->baseline_energy);
+        }
+    }
+    /* Restore telemetry fields to peak-neighborhood values. */
+    ctx->energy_high = peak_energy;
+    ctx->hf_ratio = peak_hf;
     ctx->event_peak_impulse = (float)peak;
-    ctx->event_impulse_sum = impulse;
+    /* Use wavelet-domain integral as the primary impulse for calibration. */
+    if (wave_impulse > 0xFFFFFFFFULL)
+        wave_impulse = 0xFFFFFFFFULL;
+    ctx->event_impulse_sum = (wave_impulse > 0) ? (float)((uint32_t)wave_impulse) : impulse;
     ctx->event_effective_start = start;
     ctx->event_effective_end = end;
     ctx->last_event_raw_samples = (uint32_t)(end - start + 1);
+    ctx->event_window_count = (uint8_t)((active_count > 255U) ? 255U : active_count);
 
-    if (ctx->baseline_energy > 0 && ctx->energy_high >= ctx->baseline_energy)
-        ctx->event_peak_norm_ratio = (uint32_t)(((uint64_t)(ctx->energy_high - ctx->baseline_energy) * 1000ULL) / ctx->baseline_energy);
+    if (ctx->baseline_energy > 0 && peak_energy >= ctx->baseline_energy)
+        ctx->event_peak_norm_ratio = (uint32_t)(((uint64_t)(peak_energy - ctx->baseline_energy) * 1000ULL) / ctx->baseline_energy);
     else
         ctx->event_peak_norm_ratio = 0;
 }
@@ -201,16 +249,28 @@ static void EventEnvelope_Finalize(WaveletEnergyCtx_t *ctx)
         return;
 
     EventSnapshot_Analyze(ctx);
-    ctx->impulse_rain = ctx->event_impulse_sum;
-    ctx->energy_high = ctx->event_peak_energy;
-    ctx->energy_delta = ctx->event_peak_delta;
-    ctx->norm_ratio = ctx->event_peak_norm_ratio;
-    ctx->hf_ratio = ctx->event_hf_ratio;
-    ctx->event_type = WE_EVENT_RAIN;
+    /* Post-check: only publish a snapshot if it looks like a real event.
+     * This keeps IMP/width stable when there is only baseline noise. */
+    if (ctx->event_peak_energy >= ctx->threshold_energy &&
+        ctx->event_peak_delta >= WE_MIN_ENERGY_DELTA &&
+        ctx->event_impulse_sum >= (float)WE_EVENT_MIN_IMPULSE_SUM &&
+        ctx->event_window_count >= (uint8_t)WE_EVENT_MIN_ACTIVE_SAMPLES)
+    {
+        ctx->impulse_rain = ctx->event_impulse_sum;
+        ctx->energy_high = ctx->event_peak_energy;
+        ctx->energy_delta = ctx->event_peak_delta;
+        ctx->norm_ratio = ctx->event_peak_norm_ratio;
+        ctx->hf_ratio = ctx->event_hf_ratio;
+        ctx->event_type = WE_EVENT_RAIN;
 
-    ctx->total_events++;
-    ctx->rain_count++;
-    ctx->rain_event_pending = 1;
+        ctx->total_events++;
+        ctx->rain_count++;
+        ctx->rain_event_pending = 1;
+    }
+    else
+    {
+        ctx->event_type = WE_EVENT_NONE;
+    }
 
     ctx->deadtime_raw_remaining = Compute_Deadtime_RawSamples(ctx);
     EventEnvelope_Reset(ctx);
@@ -349,6 +409,17 @@ void WaveletEnergy_Init(WaveletEnergyCtx_t *ctx, uint16_t learning_sec)
     ctx->vib_event_pending   = 0;
     ctx->noise_event_pending = 0;
     /* actual_sample_rate_hz 默认为 0，在 InitWithSampleRate 中设置 */
+
+#if WE_DISABLE_LEARNING
+    /* Skip learning to validate snapshot+wavelet+integration pipeline first. */
+    ctx->learning_done = 1;
+    ctx->learning_elapsed_sec = ctx->learning_duration_sec;
+    ctx->event_type = WE_EVENT_NONE;
+    /* Baseline will be initialized online in WaveletEnergy_Update(). */
+    ctx->baseline_energy = 0;
+    ctx->baseline_std = 0;
+    ctx->threshold_energy = 0;
+#endif
 }
 
 /**
@@ -373,6 +444,17 @@ void WaveletEnergy_InitWithSampleRate(WaveletEnergyCtx_t *ctx, uint16_t learning
     ctx->vib_event_pending   = 0;
     ctx->noise_event_pending = 0;
     ctx->actual_sample_rate_hz = actual_sample_rate_hz;
+
+#if WE_DISABLE_LEARNING
+    /* Skip learning to validate snapshot+wavelet+integration pipeline first. */
+    ctx->learning_done = 1;
+    ctx->learning_elapsed_sec = ctx->learning_duration_sec;
+    ctx->event_type = WE_EVENT_NONE;
+    /* Baseline will be initialized online in WaveletEnergy_Update(). */
+    ctx->baseline_energy = 0;
+    ctx->baseline_std = 0;
+    ctx->threshold_energy = 0;
+#endif
 }
 
 void WaveletEnergy_Update(WaveletEnergyCtx_t *ctx,
@@ -394,16 +476,18 @@ void WaveletEnergy_Update(WaveletEnergyCtx_t *ctx,
 
     /* ===== 1. 直流基线估算 ===== */
     int32_t dc_baseline = 0;
-    if (ctx->learning_done)
+    /* Even when learning is disabled, we must still estimate dc_baseline.
+     * Otherwise window[] becomes raw ADC (large DC), causing false triggers. */
+    if (ctx->dc_baseline == 0 || !ctx->learning_done)
     {
-        /* 检测期：使用学习期得到的直流偏置 */
-        dc_baseline = (int32_t)ctx->dc_baseline;
+        Compute_DC_Baseline(ring_buf, ring_idx, &dc_baseline);
+        if (dc_baseline < 0) dc_baseline = 0;
+        if (dc_baseline > 4095) dc_baseline = 4095;
+        ctx->dc_baseline = (uint16_t)dc_baseline;
     }
     else
     {
-        /* 学习期：实时估算直流偏置 */
-        Compute_DC_Baseline(ring_buf, ring_idx, &dc_baseline);
-        ctx->dc_baseline = (uint16_t)dc_baseline;
+        dc_baseline = (int32_t)ctx->dc_baseline;
     }
 
     /* ===== 2. 取64点去直流信号 ===== */
@@ -411,6 +495,7 @@ void WaveletEnergy_Update(WaveletEnergyCtx_t *ctx,
     Fill_Window_Centered(ring_buf, ring_idx, window, dc_baseline);
 
     /* ===== 3. 学习期 ===== */
+#if !WE_DISABLE_LEARNING
     if (!ctx->learning_done)
     {
         /* 提取能量特征 */
@@ -473,9 +558,30 @@ void WaveletEnergy_Update(WaveletEnergyCtx_t *ctx,
         }
         return;
     }
+#endif
 
     /* ===== 4. 检测期 ===== */
     Extract_Energy(ctx, window);
+
+    /* In WE_DISABLE_LEARNING mode, seed baseline from live data so the threshold
+     * is not unrealistically low (which would cause "random" triggering at idle). */
+    if (ctx->baseline_energy == 0)
+    {
+        ctx->baseline_energy = ctx->energy_high;
+        if (ctx->baseline_energy < 1)
+            ctx->baseline_energy = 1;
+        /* Conservative initial deviation estimate; will be refined online. */
+        ctx->baseline_std = (ctx->baseline_energy >> 3) + 1U; /* ~12.5% + 1 */
+        ctx->threshold_energy = Saturate_U64_To_U32((uint64_t)ctx->baseline_energy +
+                                                   (uint64_t)WE_STD_FACTOR * ctx->baseline_std);
+        {
+            uint32_t min_thr = Saturate_U64_To_U32((uint64_t)ctx->baseline_energy + WE_MIN_ENERGY_DELTA);
+            if (ctx->threshold_energy < min_thr)
+                ctx->threshold_energy = min_thr;
+        }
+    }
+    if (ctx->baseline_std < 1)
+        ctx->baseline_std = 1;
 
     /* 能量增量 */
     if (ctx->energy_high >= ctx->baseline_energy)
@@ -496,14 +602,31 @@ void WaveletEnergy_Update(WaveletEnergyCtx_t *ctx,
     if (latest_raw >= ADC_Threshold && latest_signal >= (int16_t)WE_SIGNAL_MIN_ADC)
         raw_trigger = 1;
 
-    /* 基线慢速跟踪（长时间无事件时轻微调整） */
-    if (ctx->baseline_count > 1000 && ctx->energy_high < ctx->baseline_energy)
+    /* Online baseline tracking when idle (no snapshot active and no raw trigger).
+     * Keeps threshold stable across temperature drift without requiring a long learning period. */
+    if (!ctx->event_active && !raw_trigger)
     {
-        ctx->baseline_energy = (ctx->baseline_energy * 999U + ctx->energy_high) / 1000U;
-        ctx->threshold_energy = Saturate_U64_To_U32((uint64_t)ctx->baseline_energy + (uint64_t)WE_STD_FACTOR * ctx->baseline_std);
-        uint32_t min_thr = Saturate_U64_To_U32((uint64_t)ctx->baseline_energy + WE_MIN_ENERGY_DELTA);
-        if (ctx->threshold_energy < min_thr)
-            ctx->threshold_energy = min_thr;
+        /* Avoid absorbing real events: only adapt when we're below threshold. */
+        if (ctx->threshold_energy == 0 || ctx->energy_high < ctx->threshold_energy)
+        {
+            uint32_t base = ctx->baseline_energy;
+            uint32_t e = ctx->energy_high;
+            uint32_t diff = (e > base) ? (e - base) : (base - e);
+
+            /* 1/1024 IIR update. */
+            ctx->baseline_energy = (uint32_t)(((uint64_t)base * 1023ULL + (uint64_t)e + 512ULL) >> 10);
+            ctx->baseline_std = (uint32_t)(((uint64_t)ctx->baseline_std * 1023ULL + (uint64_t)diff + 512ULL) >> 10);
+            if (ctx->baseline_energy < 1) ctx->baseline_energy = 1;
+            if (ctx->baseline_std < 1) ctx->baseline_std = 1;
+
+            ctx->threshold_energy = Saturate_U64_To_U32((uint64_t)ctx->baseline_energy +
+                                                       (uint64_t)WE_STD_FACTOR * ctx->baseline_std);
+            {
+                uint32_t min_thr = Saturate_U64_To_U32((uint64_t)ctx->baseline_energy + WE_MIN_ENERGY_DELTA);
+                if (ctx->threshold_energy < min_thr)
+                    ctx->threshold_energy = min_thr;
+            }
+        }
     }
     ctx->baseline_count++;
 

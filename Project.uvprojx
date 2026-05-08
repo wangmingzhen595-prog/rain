@@ -686,9 +686,19 @@
               <FilePath>.\Hardware\AD.c</FilePath>
             </File>
             <File>
+              <FileName>RainPeakTracker.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Hardware\RainPeakTracker.c</FilePath>
+            </File>
+            <File>
               <FileName>AD.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\Hardware\AD.h</FilePath>
+            </File>
+            <File>
+              <FileName>RainPeakTracker.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Hardware\RainPeakTracker.h</FilePath>
             </File>
             <File>
               <FileName>TF_Comm.c</FileName>

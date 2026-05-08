@@ -1,0 +1,29 @@
+# Keil MDK / uVision build outputs
+Objects/
+Listings/
+*.o
+*.obj
+*.crf
+*.d
+*.dep
+*.lst
+*.map
+*.axf
+*.elf
+*.hex
+*.bin
+*.htm
+*.lnp
+*.bak
+*.orig
+
+# uVision user-specific files
+Project.uvguix.*
+*.uvguix.*
+*.uvoptx
+
+# OS/editor
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp

@@ -50,6 +50,14 @@ void Raindrop_ProcessOneDrop(uint16_t adc_peak);
 uint32_t Raindrop_VoltageToVolume_0p01mm3(uint32_t U_meas_mV, uint8_t *status_flag);
 
 /**
+ * @brief  Main positive peak amplitude to volume wrapper.
+ * @param  peak_mv: Baseline-corrected main peak amplitude in mV.
+ * @param  status_flag: Output status, same values as Raindrop_VoltageToVolume_0p01mm3().
+ * @retval Volume in 0.01mm3. Returns 0 when the current calibration treats the peak as noise.
+ */
+uint32_t Raindrop_PeakMvToVolume_0p01mm3(uint32_t peak_mv, uint8_t *status_flag);
+
+/**
  * @brief  获取累计体积总量
  * @retval 累计体积（单位：0.01mm³）
  * @note   主控可通过此函数读取累计值，然后做差分计算雨量增量

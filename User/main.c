@@ -11,11 +11,15 @@
 #include "TF_Comm.h"
 #include "SPI_SlaveLink.h"
 #include "WaveletEnergy.h"
+#include "RainPeakTracker.h"
 #include "raindrop.h"
 #include <string.h>  /* strncmp */
 
 /* ===================== Modbus 从站地址配置 ===================== */
 #define MODBUS_SLAVE_ID    1
+#ifndef CAL_PRINT_EACH_DROP
+#define CAL_PRINT_EACH_DROP 0
+#endif
 
 /* ========== 独立看门狗(IWDG)参数定义 ========== */
 #define IWDG_TIMEOUT_SECONDS    3
@@ -34,6 +38,9 @@ float current_intensity_mmh = 0.0f;
 
 /* ========== 全局变量 ========== */
 WaveletEnergyCtx_t g_we_ctx;  /* 小波能量积分上下文（DMA中断+主循环共享） */
+RainPeakTrackerCtx_t g_peak_ctx;
+RainPeakEvent_t g_last_peak_event;
+static uint32_t g_last_peak_volume_0p01mm3 = 0;
 
 /* 累计体积（单位：0.01mm³） */
 volatile uint32_t g_total_volume_0p01mm3 = 0;
@@ -59,7 +66,13 @@ typedef struct {
     uint32_t seq_in_group; /* 组内序号（1起） */
     uint32_t nr;           /* 归一化比值（×1000permille） */
     uint16_t hf;           /* 高频比例（permille） */
-    float    impulse;      /* 冲量（ADC·次） */
+    float    impulse;      /* Current impulse feature. Peak path uses mV*us. */
+    uint32_t area_mv_us;   /* Baseline-corrected positive area in mV*us. */
+    uint32_t impulse_calibrated; /* Calibrated impulse engineering unit. */
+    uint8_t  event_kind;
+    uint8_t  quality_flags;
+    uint8_t  sub_index;
+    uint8_t  sub_count;
     uint32_t event_samples; /* Event width in raw samples. */
     uint32_t dE;           /* 能量增量 */
     uint32_t time_ms;      /* 时间戳（ms） */
@@ -90,7 +103,6 @@ static void USART1_SendByte(uint8_t b);
 static void USART1_SendFloat_WithTail(float v);
 static void USART1_SendString(const char *str);
 static void USART1_SendUint32(uint32_t val);
-static void USART1_SendInt32(int32_t val);
 static uint32_t Float_To_U32_Clamp(float v, uint32_t max_val);
 static uint32_t Samples_To_Ms(uint32_t samples);
 static void Send_Live_Stream(void);
@@ -103,7 +115,11 @@ void Check_System_Status(void);
 static void CAL_ProcessCommand(const char *cmd, uint8_t len);
 static void CAL_UpdateDisplay(void);
 static void CAL_PrintADCStatus(void);
-static void CAL_RecordDrop(uint32_t nr, uint16_t hf, float impulse, uint32_t dE);
+static void CAL_PrintPeakStatus(void);
+static void CAL_RecordDrop(uint32_t nr, uint16_t hf, float impulse, uint32_t dE,
+                           uint32_t area_mv_us, uint32_t impulse_calibrated,
+                           uint8_t event_kind, uint8_t quality_flags,
+                           uint8_t sub_index, uint8_t sub_count);
 void WE_Calibration_EventCallback(
     WE_EventType_t ev_type,
     uint32_t norm_ratio,
@@ -148,6 +164,7 @@ int main(void)
     if (actual_sample_rate == 0) actual_sample_rate = 23810U; /* 降级处理 */
 
     WaveletEnergy_InitWithSampleRate(&g_we_ctx, WE_LEARNING_PERIOD_SEC, actual_sample_rate);
+    RainPeakTracker_Init(&g_peak_ctx, actual_sample_rate);
     Modbus_Slave_Init(MODBUS_SLAVE_ID, 9600);
     TF_Comm_Init();
 
@@ -168,8 +185,56 @@ int main(void)
 
     while (1)
     {
+        uint8_t peak_event_seen = 0;
+
         /* ===== 批量处理 ADC 采样数据（小波能量积分，移出 ISR） ===== */
         WaveletEnergy_ProcessNewSamples(&g_we_ctx);
+        RainPeakTracker_ProcessNewSamples(&g_peak_ctx);
+        {
+            RainPeakEvent_t peak_event;
+            while (RainPeakTracker_PopEvent(&g_peak_ctx, &peak_event))
+            {
+                uint8_t peak_status = RAIN_STATUS_NOISE;
+                uint32_t vol = peak_event.saturated ? 0U :
+                               Raindrop_PeakMvToVolume_0p01mm3(peak_event.peak_mv, &peak_status);
+
+                g_last_peak_event = peak_event;
+                g_last_peak_volume_0p01mm3 = vol;
+
+                if (peak_status != RAIN_STATUS_OK || vol == 0U)
+                    continue;
+
+                peak_event_seen = 1;
+                g_cal_detected_count++;
+
+                if (sec_index < SECONDS_WINDOW)
+                    drops_per_second[sec_index]++;
+
+                if (vol > 0)
+                {
+                    Raindrop_AddVolume(vol);
+                    g_total_volume_0p01mm3 = Raindrop_GetTotalVolume_0p01mm3();
+                }
+
+                g_we_ctx.impulse_rain = (float)peak_event.area_mv_us;
+                g_we_ctx.last_event_raw_samples = peak_event.width_samples;
+                g_we_ctx.energy_delta = peak_event.impulse_calibrated;
+                g_we_ctx.norm_ratio = peak_event.peak_mv;
+
+                TF_Comm_SendEvent(1, peak_event.peak_delta_adc,
+                                  peak_event.impulse_calibrated, 0, 1);
+                CAL_RecordDrop(peak_event.peak_mv, 0,
+                               (float)peak_event.area_mv_us,
+                               peak_event.area_adc_samples,
+                               peak_event.area_mv_us,
+                               peak_event.impulse_calibrated,
+                               peak_event.event_kind,
+                               peak_event.quality_flags,
+                               peak_event.sub_index,
+                               peak_event.sub_count);
+                g_oled.event_type = WE_EVENT_RAIN;
+            }
+        }
 
         /* ===== 串口命令接收 ===== */
         while (USART_GetFlagStatus(USART1, USART_FLAG_RXNE) != RESET)
@@ -200,6 +265,7 @@ int main(void)
             uint32_t norm = WaveletEnergy_GetNormRatio(&g_we_ctx);
             uint16_t hf  = WaveletEnergy_GetHFRatio(&g_we_ctx);
 
+#if !RPT_ENABLE_PRIMARY_RAIN_PATH
             /* 体积换算：统一使用 raindrop.c 的冲量查表法 */
             uint32_t vol = Raindrop_ImpulseToVolume(
                 g_we_ctx.impulse_rain,
@@ -220,7 +286,12 @@ int main(void)
 
             /* 标定模式：雨滴检测计数递增 + 记录数据 */
             g_cal_detected_count++;
-            CAL_RecordDrop(norm, hf, g_we_ctx.impulse_rain, g_we_ctx.energy_delta);
+            CAL_RecordDrop(norm, hf, g_we_ctx.impulse_rain, g_we_ctx.energy_delta, 0, 0,
+                           RPT_EVENT_KIND_SINGLE, RPT_QUALITY_NONE, 1, 1);
+#else
+            (void)norm;
+            (void)hf;
+#endif
 
             /* OLED 刷新缓存（每次RAIN事件刷新，稳定显示） */
             g_oled.norm_ratio    = norm;
@@ -235,7 +306,8 @@ int main(void)
                 g_cal_vib_count++;  /* 标定模式：振动计数递增 */
             }
             (void)WaveletEnergy_PopNoiseEvent(&g_we_ctx);
-            g_oled.event_type = WE_EVENT_NONE;
+            if (!peak_event_seen)
+                g_oled.event_type = WE_EVENT_NONE;
         }
 
         /* ===== 显示更新（每200ms，由硬件定时器驱动） ===== */
@@ -344,7 +416,11 @@ void Update_Display(void)
     /* ===== 行3：Cnt:xxx ===== */
     /* 雨滴计数 */
     {
+#if RPT_ENABLE_PRIMARY_RAIN_PATH
+        uint32_t cnt = g_peak_ctx.event_seq;
+#else
         uint32_t cnt = g_we_ctx.rain_count;
+#endif
         if (cnt > 999) cnt = 999;
         OLED_ShowNum(3, 5, cnt, 3);
         /* 清空行3剩余 */
@@ -590,50 +666,68 @@ static void Send_Debug_Statistics(void)
     USART1_SendString(" windows=");
     USART1_SendUint32(g_we_ctx.processed_window_count);
     USART1_SendString("\r\n");
+    USART1_SendString("peak_mv=");
+    USART1_SendUint32(g_last_peak_event.peak_mv);
+    USART1_SendString(" peak_adc=");
+    USART1_SendUint32(g_last_peak_event.peak_delta_adc);
+    USART1_SendString(" rise_us=");
+    USART1_SendUint32(g_last_peak_event.rise_us);
+    USART1_SendString(" width_us=");
+    USART1_SendUint32(g_last_peak_event.width_us);
+    USART1_SendString(" area=");
+    USART1_SendUint32(g_last_peak_event.area_adc_samples);
+    USART1_SendString(" area_mv_us=");
+    USART1_SendUint32(g_last_peak_event.area_mv_us);
+    USART1_SendString(" imp_cal=");
+    USART1_SendUint32(g_last_peak_event.impulse_calibrated);
+    USART1_SendString(" kind=");
+    USART1_SendUint32(g_last_peak_event.event_kind);
+    USART1_SendString(" q=");
+    USART1_SendUint32(g_last_peak_event.quality_flags);
+    USART1_SendString(" sub=");
+    USART1_SendUint32(g_last_peak_event.sub_index);
+    USART1_SendString("/");
+    USART1_SendUint32(g_last_peak_event.sub_count);
+    USART1_SendString(" peak_vol=");
+    USART1_SendUint32(g_last_peak_volume_0p01mm3);
+    USART1_SendString("\r\n");
+    USART1_SendString("peak_end=");
+    USART1_SendUint32(g_last_peak_event.end_reason);
+    USART1_SendString(" reject=");
+    USART1_SendUint32(g_peak_ctx.last_reject_reason);
+    USART1_SendString(" sat=");
+    USART1_SendUint32(g_last_peak_event.saturated);
+    USART1_SendString(" trig=");
+    USART1_SendUint32(g_peak_ctx.trigger_count);
+    USART1_SendString(" pub=");
+    USART1_SendUint32(g_peak_ctx.published_count);
+    USART1_SendString(" rej=");
+    USART1_SendUint32(g_peak_ctx.reject_count);
+    USART1_SendString(" max_adc=");
+    USART1_SendUint32(g_peak_ctx.max_seen_delta_adc);
+    USART1_SendString(" split=");
+    USART1_SendUint32(g_peak_ctx.split_count);
+    USART1_SendString(" comp=");
+    USART1_SendUint32(g_peak_ctx.composite_count);
+    USART1_SendString(" qovf=");
+    USART1_SendUint32(g_peak_ctx.queue_overflow_count);
+    USART1_SendString("\r\n");
     USART1_SendString("==============\r\n");
 }
 
 /* ========== 发送有符号32位整数 ========== */
-static void USART1_SendInt32(int32_t val)
-{
-    char num_str[16];
-    uint8_t idx = 0;
-    if (val < 0)
-    {
-        USART1_SendByte('-');
-        val = -val;
-    }
-    if (val == 0)
-    {
-        num_str[idx++] = '0';
-    }
-    else
-    {
-        uint8_t digits = 0;
-        uint32_t temp = (uint32_t)val;
-        while (temp > 0) { temp /= 10; digits++; }
-        idx = digits;
-        temp = (uint32_t)val;
-        while (temp > 0)
-        {
-            num_str[--idx] = '0' + (temp % 10);
-            temp /= 10;
-        }
-        idx = digits;
-    }
-    num_str[idx] = '\0';
-    USART1_SendString(num_str);
-}
-
 /* ========== 记录一滴数据 ========== */
 /**
   * @brief  记录一滴检测数据（存入内存，供后续EXPORT）
   * @param  nr       归一化比值（×1000permille）
   * @param  hf       高频比例（permille）
-  * @param  impulse  冲量（ADC·次）
+  * @param  impulse  Current impulse feature. Peak path uses mV*us.
   * @param  dE       能量增量
   */
-static void CAL_RecordDrop(uint32_t nr, uint16_t hf, float impulse, uint32_t dE)
+static void CAL_RecordDrop(uint32_t nr, uint16_t hf, float impulse, uint32_t dE,
+                           uint32_t area_mv_us, uint32_t impulse_calibrated,
+                           uint8_t event_kind, uint8_t quality_flags,
+                           uint8_t sub_index, uint8_t sub_count)
 {
     if (g_cal_record_count >= MAX_DROPS_PER_GROUP * MAX_GROUPS)
         return; /* 记录满了，丢弃 */
@@ -645,6 +739,12 @@ static void CAL_RecordDrop(uint32_t nr, uint16_t hf, float impulse, uint32_t dE)
     g_cal_records[idx].nr          = nr;
     g_cal_records[idx].hf          = hf;
     g_cal_records[idx].impulse     = impulse;
+    g_cal_records[idx].area_mv_us  = area_mv_us;
+    g_cal_records[idx].impulse_calibrated = impulse_calibrated;
+    g_cal_records[idx].event_kind  = event_kind;
+    g_cal_records[idx].quality_flags = quality_flags;
+    g_cal_records[idx].sub_index   = sub_index;
+    g_cal_records[idx].sub_count   = sub_count;
     g_cal_records[idx].event_samples = g_we_ctx.last_event_raw_samples;
     g_cal_records[idx].dE         = dE;
     g_cal_records[idx].time_ms    = g_sys_time_ms;
@@ -652,6 +752,7 @@ static void CAL_RecordDrop(uint32_t nr, uint16_t hf, float impulse, uint32_t dE)
     g_cal_record_count++;
     g_cal_group_drop_count++;
 
+#if CAL_PRINT_EACH_DROP
     /* 串口实时输出该滴数据 */
     USART1_SendString("[");
     USART1_SendString(g_cal_group_name);
@@ -673,7 +774,20 @@ static void CAL_RecordDrop(uint32_t nr, uint16_t hf, float impulse, uint32_t dE)
     USART1_SendUint32(Samples_To_Ms(g_we_ctx.last_event_raw_samples));
     USART1_SendString(" dE=");
     USART1_SendUint32(dE);
+    USART1_SendString(" area_mv_us=");
+    USART1_SendUint32(area_mv_us);
+    USART1_SendString(" imp_cal=");
+    USART1_SendUint32(impulse_calibrated);
+    USART1_SendString(" kind=");
+    USART1_SendUint32(event_kind);
+    USART1_SendString(" q=");
+    USART1_SendUint32(quality_flags);
+    USART1_SendString(" sub=");
+    USART1_SendUint32(sub_index);
+    USART1_SendString("/");
+    USART1_SendUint32(sub_count);
     USART1_SendString("\r\n");
+#endif
 }
 
 /* ========== 标定命令处理 ========== */
@@ -730,6 +844,65 @@ static void CAL_PrintADCStatus(void)
     USART1_SendString("\r\n");
 }
 
+static void CAL_PrintPeakStatus(void)
+{
+    USART1_SendString("[PK] seq=");
+    USART1_SendUint32(g_last_peak_event.seq);
+    USART1_SendString(" peak_mv=");
+    USART1_SendUint32(g_last_peak_event.peak_mv);
+    USART1_SendString(" peak_adc=");
+    USART1_SendUint32(g_last_peak_event.peak_delta_adc);
+    USART1_SendString(" base=");
+    USART1_SendUint32(g_last_peak_event.baseline_adc);
+    USART1_SendString(" rise_us=");
+    USART1_SendUint32(g_last_peak_event.rise_us);
+    USART1_SendString(" width_us=");
+    USART1_SendUint32(g_last_peak_event.width_us);
+    USART1_SendString(" area=");
+    USART1_SendUint32(g_last_peak_event.area_adc_samples);
+    USART1_SendString(" area_mv_us=");
+    USART1_SendUint32(g_last_peak_event.area_mv_us);
+    USART1_SendString(" imp_cal=");
+    USART1_SendUint32(g_last_peak_event.impulse_calibrated);
+    USART1_SendString(" kind=");
+    USART1_SendUint32(g_last_peak_event.event_kind);
+    USART1_SendString(" q=");
+    USART1_SendUint32(g_last_peak_event.quality_flags);
+    USART1_SendString(" sub=");
+    USART1_SendUint32(g_last_peak_event.sub_index);
+    USART1_SendString("/");
+    USART1_SendUint32(g_last_peak_event.sub_count);
+    USART1_SendString(" end=");
+    USART1_SendUint32(g_last_peak_event.end_reason);
+    USART1_SendString(" reject=");
+    USART1_SendUint32(g_peak_ctx.last_reject_reason);
+    USART1_SendString(" sat=");
+    USART1_SendUint32(g_last_peak_event.saturated);
+    USART1_SendString("\r\n[PKSTAT] trig=");
+    USART1_SendUint32(g_peak_ctx.trigger_count);
+    USART1_SendString(" pub=");
+    USART1_SendUint32(g_peak_ctx.published_count);
+    USART1_SendString(" rej=");
+    USART1_SendUint32(g_peak_ctx.reject_count);
+    USART1_SendString(" sat_cnt=");
+    USART1_SendUint32(g_peak_ctx.saturated_count);
+    USART1_SendString(" max_adc=");
+    USART1_SendUint32(g_peak_ctx.max_seen_delta_adc);
+    USART1_SendString(" thr=");
+    USART1_SendUint32(g_peak_ctx.trigger_delta_adc);
+    USART1_SendString(" end_thr=");
+    USART1_SendUint32(g_peak_ctx.end_delta_adc);
+    USART1_SendString(" min=");
+    USART1_SendUint32(g_peak_ctx.min_peak_delta_adc);
+    USART1_SendString(" split=");
+    USART1_SendUint32(g_peak_ctx.split_count);
+    USART1_SendString(" comp=");
+    USART1_SendUint32(g_peak_ctx.composite_count);
+    USART1_SendString(" qovf=");
+    USART1_SendUint32(g_peak_ctx.queue_overflow_count);
+    USART1_SendString("\r\n");
+}
+
 static void CAL_ProcessCommand(const char *cmd, uint8_t len)
 {
     if (len == 0) return;
@@ -737,6 +910,12 @@ static void CAL_ProcessCommand(const char *cmd, uint8_t len)
     if (strncmp(cmd, "adc", len) == 0)
     {
         CAL_PrintADCStatus();
+        return;
+    }
+
+    if (strncmp(cmd, "peak", len) == 0 || strncmp(cmd, "pkstat", len) == 0)
+    {
+        CAL_PrintPeakStatus();
         return;
     }
 
@@ -785,6 +964,10 @@ static void CAL_ProcessCommand(const char *cmd, uint8_t len)
             USART1_SendUint32(Float_To_U32_Clamp(g_we_ctx.impulse_rain, 0xFFFFFFFFU));
             USART1_SendString("\r\nlast_width_ms=");
             USART1_SendUint32(Samples_To_Ms(g_we_ctx.last_event_raw_samples));
+            USART1_SendString("\r\nlast_area_mv_us=");
+            USART1_SendUint32(g_last_peak_event.area_mv_us);
+            USART1_SendString("\r\nlast_imp_cal=");
+            USART1_SendUint32(g_last_peak_event.impulse_calibrated);
             USART1_SendString("\r\n");
         }
         USART1_SendString("sys_time=");
@@ -809,7 +992,7 @@ static void CAL_ProcessCommand(const char *cmd, uint8_t len)
     if (strncmp(cmd, "export", len) == 0)
     {
         USART1_SendString("[CAL] === EXPORT START ===\r\n");
-        USART1_SendString("# group    seq    impulse      width_ms   nr      hf     dE       time_ms\r\n");
+        USART1_SendString("# group    seq    impulse      width_ms   nr      hf     dE       area_mv_us  imp_cal   kind q sub/subs time_ms\r\n");
         for (uint16_t i = 0; i < g_cal_record_count; i++)
         {
             CalDropRecord_t *r = &g_cal_records[i];
@@ -840,6 +1023,18 @@ static void CAL_ProcessCommand(const char *cmd, uint8_t len)
             USART1_SendString("     ");
             /* dE */
             USART1_SendUint32(r->dE);
+            USART1_SendString("     ");
+            USART1_SendUint32(r->area_mv_us);
+            USART1_SendString("     ");
+            USART1_SendUint32(r->impulse_calibrated);
+            USART1_SendString("     ");
+            USART1_SendUint32(r->event_kind);
+            USART1_SendString("     ");
+            USART1_SendUint32(r->quality_flags);
+            USART1_SendString("     ");
+            USART1_SendUint32(r->sub_index);
+            USART1_SendString("/");
+            USART1_SendUint32(r->sub_count);
             USART1_SendString("     ");
             /* time_ms */
             USART1_SendUint32(r->time_ms);
@@ -888,6 +1083,8 @@ static void CAL_ProcessCommand(const char *cmd, uint8_t len)
         USART1_SendString("[CAL] === Commands ===\r\n");
         USART1_SendString("SETN name - set needle name\r\n");
         USART1_SendString("ADC       - show raw ADC status\r\n");
+        USART1_SendString("PEAK      - show peak tracker status\r\n");
+        USART1_SendString("PKSTAT    - show peak tracker counters\r\n");
         USART1_SendString("STAT      - show stats\r\n");
         USART1_SendString("EXPORT    - dump all data\r\n");
         USART1_SendString("RESET     - clear all\r\n");
