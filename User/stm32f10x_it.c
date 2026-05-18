@@ -24,7 +24,8 @@
 /* Includes ------------------------------------------------------------------*/
 #include "stm32f10x_it.h"
 #include "AD.h"                          // 添加AD头文件
-#include "TF_Comm.h"                     // TF通信模块头文件
+#include "Modbus_Slave.h"               // Modbus从站头文件（USART2）
+#include "SPI_SlaveLink.h"              // SPI 从机链路层（SPI1 + EXTI4）
 
 /* 峰值检测相关常量定义（与main.c保持一致） */
 #define PEAK_STATE_IDLE         0        // 空闲状态
@@ -234,6 +235,10 @@ static void Process_ADC_Sample(uint8_t channel, uint16_t value, uint16_t ring_in
     extern volatile uint16_t last_peak_value_from_isr;
     extern volatile uint16_t last_peak_index_from_isr;
     extern volatile uint8_t  last_peak_ready_from_isr;
+    extern volatile uint16_t adc_ring_buffer_ch0[RING_BUFFER_SIZE];
+    extern volatile uint16_t last_peak_window_from_isr[ISR_CAPTURE_WINDOW_SIZE];
+    extern volatile uint16_t last_peak_window_len_from_isr;
+    extern volatile int32_t last_peak_baseline_from_isr;
 
     PeakDetectorContext *ctx = &peak_ctx[channel];
     volatile uint16_t *dynamic_thr = &dynamic_threshold;   /* 当前只使用通道0的动态阈值 */
@@ -373,6 +378,36 @@ static void Process_ADC_Sample(uint8_t channel, uint16_t value, uint16_t ring_in
                 /* 降低阈值到80，适配420-540mV小雨滴信号（约320-410mV相对基线） */
                 if (channel == 0 && ctx->local_max > (ctx->baseline_value + 80))
                 {
+                    uint16_t win_start = (ctx->local_max_index >= ISR_CAPTURE_PRE_SAMPLES) ?
+                        (uint16_t)(ctx->local_max_index - ISR_CAPTURE_PRE_SAMPLES) :
+                        (uint16_t)(RING_BUFFER_SIZE + ctx->local_max_index - ISR_CAPTURE_PRE_SAMPLES);
+                    uint16_t post_samples = (ring_index >= ctx->local_max_index) ?
+                        (uint16_t)(ring_index - ctx->local_max_index) :
+                        (uint16_t)(RING_BUFFER_SIZE - ctx->local_max_index + ring_index);
+                    uint16_t window_len;
+                    int32_t baseline_start = (int32_t)win_start - (int32_t)ISR_CAPTURE_BASELINE_SAMPLES;
+                    uint32_t baseline_sum = 0;
+
+                    if (post_samples > ISR_CAPTURE_POST_SAMPLES)
+                    {
+                        post_samples = ISR_CAPTURE_POST_SAMPLES;
+                    }
+                    window_len = (uint16_t)(ISR_CAPTURE_PRE_SAMPLES + 1U + post_samples);
+                    while (baseline_start < 0)
+                    {
+                        baseline_start += RING_BUFFER_SIZE;
+                    }
+                    for (uint16_t k = 0; k < ISR_CAPTURE_BASELINE_SAMPLES; k++)
+                    {
+                        baseline_sum += adc_ring_buffer_ch0[(uint16_t)((baseline_start + k) % RING_BUFFER_SIZE)];
+                    }
+                    last_peak_baseline_from_isr = (int32_t)(baseline_sum / ISR_CAPTURE_BASELINE_SAMPLES);
+                    for (uint16_t k = 0; k < window_len; k++)
+                    {
+                        last_peak_window_from_isr[k] = adc_ring_buffer_ch0[(uint16_t)((win_start + k) % RING_BUFFER_SIZE)];
+                    }
+                    last_peak_window_len_from_isr = window_len;
+
                     last_peak_value_from_isr = ctx->local_max;
                     last_peak_index_from_isr = ctx->local_max_index;
                     last_peak_ready_from_isr = 1;
@@ -636,12 +671,21 @@ void ADC1_2_IRQHandler(void)
         ADC_ClearITPendingBit(ADC1, ADC_IT_AWD);
     }
 }
+
 /**
-  * @brief  USART2中断处理函数（用于TF通信模块）
+  * @brief  SPI1中断处理函数（RXNE/TXE，用于SPI从机链路层）
   */
-void USART2_IRQHandler(void)
+void SPI1_IRQHandler(void)
 {
-    TF_Comm_TX_IRQHandler();  // 在TF_Comm.c中实现
+    SPI_SlaveLink_SPI1_IRQHandler();
+}
+
+/**
+  * @brief  EXTI4中断处理函数（NSS 边沿，用于SPI从机事务边界）
+  */
+void EXTI4_IRQHandler(void)
+{
+    SPI_SlaveLink_EXTI4_IRQHandler();
 }
 
 /**

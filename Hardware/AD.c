@@ -14,6 +14,9 @@ volatile uint16_t adc_ring_buffer_ch0[RING_BUFFER_SIZE];  // 通道0环形缓冲
 volatile uint16_t adc_ring_buffer_ch1[RING_BUFFER_SIZE];  // 通道1环形缓冲区
 volatile uint16_t ring_write_index_ch0 = 0;  // 通道0写索引
 volatile uint16_t ring_write_index_ch1 = 0;  // 通道1写索引
+volatile uint16_t last_peak_window_from_isr[ISR_CAPTURE_WINDOW_SIZE]; // ISR锁定峰值时复制的主脉冲窗口
+volatile uint16_t last_peak_window_len_from_isr = 0; // ISR窗口实际有效长度
+volatile int32_t last_peak_baseline_from_isr = 0; // ISR窗口对应的峰前基线
 
 /* Keil Array Visualization 可观察数组（500个元素） */
 /* 用于在Keil调试器中观察ADC采样数据，确保数组在文件作用域声明为全局变量 */
@@ -89,9 +92,9 @@ void AD_Init(void)
     
     // 配置ADC规则组通道：双通道扫描模式（PA0和PA1）
     // 通道0（PA0）：采样顺序1、采样时间239.5个周期（最大采样时间，适用于高阻抗信号源）
-    ADC_RegularChannelConfig(ADC1, ADC_Channel_0, 1, ADC_SampleTime_239Cycles5);
+    ADC_RegularChannelConfig(ADC1, ADC_Channel_0, 1, RAIN_ADC_SAMPLE_TIME);
     // 通道1（PA1）：采样顺序2、采样时间239.5个周期（用于PA0饱和时切换）
-    ADC_RegularChannelConfig(ADC1, ADC_Channel_1, 2, ADC_SampleTime_239Cycles5);
+    ADC_RegularChannelConfig(ADC1, ADC_Channel_1, 2, RAIN_ADC_SAMPLE_TIME);
     
     // ADC初始化配置（双通道扫描模式）
     ADC_InitStructure.ADC_Mode = ADC_Mode_Independent;              // 独立模式
