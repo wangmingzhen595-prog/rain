@@ -55,6 +55,11 @@ extern volatile uint32_t sampling_tick_counter;
 extern volatile uint16_t ADC_Visualize_Buffer[500];  // ADC可视化缓冲区（通道0数据）
 extern volatile uint16_t ADC_Visualize_Index;         // 可视化缓冲区写索引
 
+extern volatile uint16_t dbg_pair_pa0_last;
+extern volatile uint16_t dbg_pair_pa1_last;
+extern volatile uint16_t dbg_pair_write_idx;
+extern volatile uint32_t dbg_pair_write_count;
+
 /* 阈值接口（ADC单位，默认200，可在main中覆盖） */
 extern volatile uint16_t ADC_Threshold;
 void AD_SetThreshold(uint16_t threshold);

@@ -1,30 +1,44 @@
 #include "RegisterMap.h"
 
-/* 复用原 Modbus_Slave.c 中的外部数据源 */
-extern volatile uint32_t effective_drop_count;
-extern volatile uint32_t raw_event_count;
-extern volatile float    total_rain_mm;
-extern float             voltage_sum;           /* 累计电压 */
-extern uint16_t          current_peak;
-extern float             current_voltage;
-extern float             current_intensity_mmh;
-extern volatile uint16_t dynamic_threshold;
-extern char              last_gain_used;
-extern volatile uint32_t sampling_tick_counter;
-extern volatile uint32_t watchdog_trigger_count;
-extern volatile uint32_t snapshot_valid_count;
-extern volatile uint32_t cnt_rain_clean;
-extern volatile uint32_t cnt_rain_fast;
-extern volatile uint32_t cnt_vib;
-extern volatile uint32_t cnt_emi;
-extern volatile uint32_t cnt_bg;
-extern volatile uint32_t cnt_bad;
-/* 雨滴体积换算模块外部接口 */
-extern uint32_t Raindrop_GetTotalVolume_0p01mm3(void);
+#include "AD.h"
+#include "RainAreaBuffer.h"
 
-/* 内部镜像：从站地址与阈值配置（与原 Modbus 保持语义一致） */
-static volatile uint8_t  s_slave_addr   = 1;  /* Holding 0x0000 */
-static volatile uint16_t s_threshold_cfg = 0; /* Holding 0x0001 */
+static volatile uint8_t  s_slave_addr = 1;   /* Holding 0x0000 */
+static volatile uint16_t s_threshold_cfg = 0;/* Kept for legacy local access only. */
+
+static uint16_t Read_U32_High(uint32_t value)
+{
+    return (uint16_t)((value >> 16) & 0xFFFFU);
+}
+
+static uint16_t Read_U32_Low(uint32_t value)
+{
+    return (uint16_t)(value & 0xFFFFU);
+}
+
+static uint16_t Read_Event_Field(const RainAreaEvent_t *evt, uint16_t base, uint16_t addr)
+{
+    switch ((uint16_t)(addr - base))
+    {
+        case 0x0000: return evt->seq;
+        case 0x0001: return evt->peak_adc;
+        case 0x0002: return evt->baseline_adc;
+        case 0x0003: return evt->pulse_width_samples;
+        case 0x0004: return Read_U32_High(evt->area_adc_us);
+        case 0x0005: return Read_U32_Low(evt->area_adc_us);
+        case 0x0006: return Read_U32_High(evt->area_adc_samples);
+        case 0x0007: return Read_U32_Low(evt->area_adc_samples);
+        case 0x0008: return evt->flags;
+        case 0x0009: return evt->source_channel;
+        case 0x000A: return evt->max_sat_count;
+        case 0x000B: return evt->gain_x100;
+        case 0x000C: return Read_U32_High(evt->raw_integral_adc_us);
+        case 0x000D: return Read_U32_Low(evt->raw_integral_adc_us);
+        case 0x000E: return Read_U32_High(evt->scaled_integral_adc_us);
+        case 0x000F: return Read_U32_Low(evt->scaled_integral_adc_us);
+        default:     return 0;
+    }
+}
 
 void RegisterMap_Init(uint8_t slave_addr_init)
 {
@@ -32,8 +46,8 @@ void RegisterMap_Init(uint8_t slave_addr_init)
     {
         slave_addr_init = 1;
     }
-    s_slave_addr   = slave_addr_init;
-    s_threshold_cfg = dynamic_threshold; /* 初始配置阈值取当前动态阈值 */
+    s_slave_addr = slave_addr_init;
+    s_threshold_cfg = 0;
 }
 
 uint8_t RegisterMap_GetSlaveAddr(void)
@@ -43,7 +57,7 @@ uint8_t RegisterMap_GetSlaveAddr(void)
 
 void RegisterMap_SetSlaveAddr(uint8_t addr)
 {
-    if (addr == 0)
+    if (addr == 0 || addr > 247U)
     {
         return;
     }
@@ -73,18 +87,14 @@ uint16_t RegisterMap_ReadHolding(uint16_t addr, uint8_t *exception)
             return (uint16_t)s_slave_addr;
 
         case 0x0001:
-            return s_threshold_cfg;
-
         case 0x0002:
         case 0x0003:
-        case 0x0004:
-            /* 预留：暂不使用，返回0 */
             return 0;
 
         default:
             if (exception)
             {
-                *exception = 0x02; /* Illegal Data Address */
+                *exception = 0x02;
             }
             return 0;
     }
@@ -100,30 +110,56 @@ uint8_t RegisterMap_WriteHolding(uint16_t addr, uint16_t value, uint8_t *excepti
     switch (addr)
     {
         case 0x0000:
-            /* 从站地址修改：仅更新本地镜像，具体是否生效由上层决定 */
-            if (value != 0 && value <= 247)
+            if (value != 0U && value <= 247U)
             {
                 s_slave_addr = (uint8_t)value;
                 return 1;
             }
-            else
+            if (exception)
             {
-                if (exception)
-                {
-                    *exception = 0x03; /* Illegal Data Value */
-                }
-                return 0;
+                *exception = 0x03;
             }
+            return 0;
 
         case 0x0001:
-            /* 阈值配置：只更新镜像，不直接改 dynamic_threshold，由上层决定是否应用 */
-            s_threshold_cfg = value;
             return 1;
+
+        case 0x0002:
+            if (value == 1U)
+            {
+                (void)RainAreaBuffer_PopOldest();
+                return 1;
+            }
+            if (value == 0U)
+            {
+                return 1;
+            }
+            if (exception)
+            {
+                *exception = 0x03;
+            }
+            return 0;
+
+        case 0x0003:
+            if (value == 0xA55AU)
+            {
+                RainAreaBuffer_ClearStats();
+                return 1;
+            }
+            if (value == 0U)
+            {
+                return 1;
+            }
+            if (exception)
+            {
+                *exception = 0x03;
+            }
+            return 0;
 
         default:
             if (exception)
             {
-                *exception = 0x02; /* Illegal Data Address */
+                *exception = 0x02;
             }
             return 0;
     }
@@ -131,6 +167,9 @@ uint8_t RegisterMap_WriteHolding(uint16_t addr, uint16_t value, uint8_t *excepti
 
 uint16_t RegisterMap_ReadInput(uint16_t addr, uint8_t *exception)
 {
+    RainAreaEvent_t evt;
+    uint32_t value32;
+
     if (exception)
     {
         *exception = 0;
@@ -138,110 +177,74 @@ uint16_t RegisterMap_ReadInput(uint16_t addr, uint8_t *exception)
 
     switch (addr)
     {
-        case 0x0000: return (uint16_t)((effective_drop_count >> 16) & 0xFFFF);
-        case 0x0001: return (uint16_t)(effective_drop_count & 0xFFFF);
-
-        case 0x0002: return (uint16_t)((raw_event_count >> 16) & 0xFFFF);
-        case 0x0003: return (uint16_t)(raw_event_count & 0xFFFF);
-
+        case 0x0000:
+            return (uint16_t)RAIN_AREA_FIRMWARE_VERSION;
+        case 0x0001:
+            return (uint16_t)RAIN_AREA_PROTOCOL_VERSION;
+        case 0x0002:
+            return (uint16_t)s_slave_addr;
+        case 0x0003:
+            return RainAreaBuffer_GetCount();
         case 0x0004:
+            value32 = RainAreaBuffer_GetTotalSavedCount();
+            return Read_U32_High(value32);
         case 0x0005:
-        {
-            union { float f; uint32_t u; } conv;
-            conv.f = total_rain_mm;
-            if (addr == 0x0004)
-                return (uint16_t)((conv.u >> 16) & 0xFFFF);
-            else
-                return (uint16_t)(conv.u & 0xFFFF);
-        }
-
+            value32 = RainAreaBuffer_GetTotalSavedCount();
+            return Read_U32_Low(value32);
         case 0x0006:
-            return current_peak;
-
+            value32 = RainAreaBuffer_GetOverflowCount();
+            return Read_U32_High(value32);
         case 0x0007:
+            value32 = RainAreaBuffer_GetOverflowCount();
+            return Read_U32_Low(value32);
         case 0x0008:
-        {
-            union { float f; uint32_t u; } conv;
-            conv.f = current_voltage;
-            if (addr == 0x0007)
-                return (uint16_t)((conv.u >> 16) & 0xFFFF);
-            else
-                return (uint16_t)(conv.u & 0xFFFF);
-        }
-
+            return (uint16_t)((ADC_SAMPLE_INTERVAL_NS + 500UL) / 1000UL);
         case 0x0009:
-        case 0x000A:
-        {
-            union { float f; uint32_t u; } conv;
-            conv.f = current_intensity_mmh;
-            if (addr == 0x0009)
-                return (uint16_t)((conv.u >> 16) & 0xFFFF);
-            else
-                return (uint16_t)(conv.u & 0xFFFF);
-        }
+            return 0;
 
-        case 0x000B:
-            return dynamic_threshold;
-
-        case 0x000C:
-            return (last_gain_used == 'L') ? 1 : 0;
-
-        case 0x000D: return (uint16_t)((sampling_tick_counter >> 16) & 0xFFFF);
-        case 0x000E: return (uint16_t)(sampling_tick_counter & 0xFFFF);
-
-        case 0x000F: return (uint16_t)((watchdog_trigger_count >> 16) & 0xFFFF);
-        case 0x0010: return (uint16_t)(watchdog_trigger_count & 0xFFFF);
-
-        case 0x0011: return (uint16_t)((snapshot_valid_count >> 16) & 0xFFFF);
-        case 0x0012: return (uint16_t)(snapshot_valid_count & 0xFFFF);
-
-        case 0x0013: return (uint16_t)((cnt_rain_clean >> 16) & 0xFFFF);
-        case 0x0014: return (uint16_t)(cnt_rain_clean & 0xFFFF);
-
-        case 0x0015: return (uint16_t)((cnt_rain_fast >> 16) & 0xFFFF);
-        case 0x0016: return (uint16_t)(cnt_rain_fast & 0xFFFF);
-
-        case 0x0017: return (uint16_t)((cnt_vib >> 16) & 0xFFFF);
-        case 0x0018: return (uint16_t)(cnt_vib & 0xFFFF);
-
-        case 0x0019: return (uint16_t)((cnt_emi >> 16) & 0xFFFF);
-        case 0x001A: return (uint16_t)(cnt_emi & 0xFFFF);
-
-        case 0x001B: return (uint16_t)((cnt_bg >> 16) & 0xFFFF);
-        case 0x001C: return (uint16_t)(cnt_bg & 0xFFFF);
-
-        case 0x001D: return (uint16_t)((cnt_bad >> 16) & 0xFFFF);
-        case 0x001E: return (uint16_t)(cnt_bad & 0xFFFF);
-
-        /* 累计电压 (float, 2个寄存器) */
+        case 0x0010:
+        case 0x0011:
+        case 0x0012:
+        case 0x0013:
+        case 0x0014:
+        case 0x0015:
+        case 0x0016:
+        case 0x0017:
+        case 0x0018:
+        case 0x0019:
+        case 0x001A:
+        case 0x001B:
+        case 0x001C:
+        case 0x001D:
+        case 0x001E:
         case 0x001F:
-        case 0x0020:
-        {
-            union { float f; uint32_t u; } conv;
-            conv.f = voltage_sum;
-            if (addr == 0x001F)
-                return (uint16_t)((conv.u >> 16) & 0xFFFF);
-            else
-                return (uint16_t)(conv.u & 0xFFFF);
-        }
+            (void)RainAreaBuffer_GetLatest(&evt);
+            return Read_Event_Field(&evt, 0x0010U, addr);
 
-        /* 累计体积 (uint32_t, 单位0.01mm³, 2个寄存器) */
+        case 0x0020:
         case 0x0021:
         case 0x0022:
-        {
-            uint32_t volume_sum = Raindrop_GetTotalVolume_0p01mm3();
-            if (addr == 0x0021)
-                return (uint16_t)((volume_sum >> 16) & 0xFFFF);
-            else
-                return (uint16_t)(volume_sum & 0xFFFF);
-        }
+        case 0x0023:
+        case 0x0024:
+        case 0x0025:
+        case 0x0026:
+        case 0x0027:
+        case 0x0028:
+        case 0x0029:
+        case 0x002A:
+        case 0x002B:
+        case 0x002C:
+        case 0x002D:
+        case 0x002E:
+        case 0x002F:
+            (void)RainAreaBuffer_PeekOldest(&evt);
+            return Read_Event_Field(&evt, 0x0020U, addr);
 
         default:
             if (exception)
             {
-                *exception = 0x02; /* Illegal Data Address */
+                *exception = 0x02;
             }
             return 0;
     }
 }
-

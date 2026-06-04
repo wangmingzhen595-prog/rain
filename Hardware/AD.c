@@ -25,6 +25,11 @@ volatile int32_t last_peak_baseline_from_isr = 0; // ISR窗口对应的峰前基
 volatile uint16_t ADC_Visualize_Buffer[500];  // ADC可视化缓冲区（通道0数据）
 volatile uint16_t ADC_Visualize_Index = 0;     // 可视化缓冲区写索引
 
+volatile uint16_t dbg_pair_pa0_last = 0;
+volatile uint16_t dbg_pair_pa1_last = 0;
+volatile uint16_t dbg_pair_write_idx = 0;
+volatile uint32_t dbg_pair_write_count = 0;
+
 
 volatile uint8_t snapshot_ready = 0;
 volatile uint16_t snapshot_buffer_high[SNAPSHOT_SIZE];

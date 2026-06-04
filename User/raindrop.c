@@ -3,7 +3,7 @@
 
 /* 电压校准系数（与main.c保持一致） */
 #ifndef ADC_VOLTAGE_CALIBRATION_FACTOR
-#define ADC_VOLTAGE_CALIBRATION_FACTOR  0.9155f  // 电压校准系数（示波器2.60V对应单片机2.84V：2.60/2.84≈0.9155）
+#define ADC_VOLTAGE_CALIBRATION_FACTOR  1.0f     // 电压不再全局缩小，按3.3V参考值换算
 #endif
 
 /* ===================== LUT数据表（电压mV，体积0.01mm³） ===================== */

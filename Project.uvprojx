@@ -731,6 +731,16 @@
               <FilePath>.\Hardware\RegisterMap.h</FilePath>
             </File>
             <File>
+              <FileName>RainAreaBuffer.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Hardware\RainAreaBuffer.c</FilePath>
+            </File>
+            <File>
+              <FileName>RainAreaBuffer.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Hardware\RainAreaBuffer.h</FilePath>
+            </File>
+            <File>
               <FileName>SPI_Proto.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\Hardware\SPI_Proto.c</FilePath>

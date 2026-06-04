@@ -465,7 +465,9 @@ static void Process_ADC_Sample(uint8_t channel, uint16_t value, uint16_t ring_in
 static void Start_Snapshot_From_Index(uint16_t trig_idx_ch0, uint16_t trig_val_ch0)
 {
     extern volatile uint16_t adc_ring_buffer_ch0[RING_BUFFER_SIZE];
+    extern volatile uint16_t adc_ring_buffer_ch1[RING_BUFFER_SIZE];
     extern volatile uint16_t snapshot_buffer_high[SNAPSHOT_SIZE];
+    extern volatile uint16_t snapshot_buffer_low[SNAPSHOT_SIZE];
     extern volatile uint16_t snapshot_write_index;
     extern volatile uint8_t snapshot_collecting;
     extern volatile uint8_t snapshot_ready;
@@ -480,11 +482,14 @@ static void Start_Snapshot_From_Index(uint16_t trig_idx_ch0, uint16_t trig_val_c
 
     for (uint16_t k = 0; k < SNAPSHOT_PRE_SAMPLES; k++)
     {
-        snapshot_buffer_high[k] = adc_ring_buffer_ch0[(start_high + k) % RING_BUFFER_SIZE];
+        uint16_t idx = (uint16_t)((start_high + k) % RING_BUFFER_SIZE);
+        snapshot_buffer_high[k] = adc_ring_buffer_ch0[idx];
+        snapshot_buffer_low[k] = adc_ring_buffer_ch1[idx];
     }
 
     /* 将触发样本放在索引 SNAPSHOT_PRE_SAMPLES */
     snapshot_buffer_high[SNAPSHOT_PRE_SAMPLES] = trig_val_ch0;
+    snapshot_buffer_low[SNAPSHOT_PRE_SAMPLES] = adc_ring_buffer_ch1[trig_idx_ch0];
 
     /* 保存触发时的环形缓冲区索引，用于后续计算PA1对应位置 */
     extern volatile uint16_t snapshot_trigger_index_ch0;
@@ -573,12 +578,19 @@ void DMA1_Channel1_IRQHandler(void)
         uint8_t i;
         for (i = 0; i < 50; i++)  // 每次处理一对PA0和PA1数据
         {
-            /* 处理PA0数据：写入环形缓冲区和快照缓冲区（现有逻辑保持不变） */
-            uint16_t ch0_value = AD_Value[i * 2];  // PA0数据
-
+            uint16_t ch0_value = AD_Value[i * 2];      // PA0数据
+            uint16_t ch1_value = AD_Value[i * 2 + 1];  // PA1数据
             uint16_t current_index = ring_write_index_ch0;
+            uint16_t next_index = (uint16_t)((current_index + 1U) % RING_BUFFER_SIZE);
+
             adc_ring_buffer_ch0[current_index] = ch0_value;
-            ring_write_index_ch0 = (current_index + 1) % RING_BUFFER_SIZE;
+            adc_ring_buffer_ch1[current_index] = ch1_value;
+            ring_write_index_ch0 = next_index;
+            ring_write_index_ch1 = next_index;
+            dbg_pair_pa0_last = ch0_value;
+            dbg_pair_pa1_last = ch1_value;
+            dbg_pair_write_idx = current_index;
+            dbg_pair_write_count++;
             Process_ADC_Sample(0, ch0_value, current_index);
             sampling_tick_counter++;
 
@@ -587,6 +599,7 @@ void DMA1_Channel1_IRQHandler(void)
             if (snapshot_collecting && snapshot_write_index < SNAPSHOT_SIZE)
             {
                 snapshot_buffer_high[snapshot_write_index] = ch0_value;
+                snapshot_buffer_low[snapshot_write_index] = ch1_value;
                 snapshot_write_index++;
                 if (snapshot_write_index >= SNAPSHOT_SIZE)
                 {
@@ -594,12 +607,6 @@ void DMA1_Channel1_IRQHandler(void)
                     snapshot_collecting = 0;
                 }
             }
-            
-            /* 处理PA1数据：只写入环形缓冲区，不写入快照缓冲区 */
-            uint16_t ch1_value = AD_Value[i * 2 + 1];  // PA1数据
-            uint16_t ch1_index = ring_write_index_ch1;
-            adc_ring_buffer_ch1[ch1_index] = ch1_value;
-            ring_write_index_ch1 = (ch1_index + 1) % RING_BUFFER_SIZE;
         }
         DMA_ClearITPendingBit(DMA1_IT_HT1);
     }
@@ -614,12 +621,19 @@ void DMA1_Channel1_IRQHandler(void)
         uint8_t i;
         for (i = 50; i < 100; i++)  // 每次处理一对PA0和PA1数据
         {
-            /* 处理PA0数据：写入环形缓冲区和快照缓冲区（现有逻辑保持不变） */
-            uint16_t ch0_value = AD_Value[i * 2];  // PA0数据
-
+            uint16_t ch0_value = AD_Value[i * 2];      // PA0数据
+            uint16_t ch1_value = AD_Value[i * 2 + 1];  // PA1数据
             uint16_t current_index = ring_write_index_ch0;
+            uint16_t next_index = (uint16_t)((current_index + 1U) % RING_BUFFER_SIZE);
+
             adc_ring_buffer_ch0[current_index] = ch0_value;
-            ring_write_index_ch0 = (current_index + 1) % RING_BUFFER_SIZE;
+            adc_ring_buffer_ch1[current_index] = ch1_value;
+            ring_write_index_ch0 = next_index;
+            ring_write_index_ch1 = next_index;
+            dbg_pair_pa0_last = ch0_value;
+            dbg_pair_pa1_last = ch1_value;
+            dbg_pair_write_idx = current_index;
+            dbg_pair_write_count++;
             Process_ADC_Sample(0, ch0_value, current_index);
             sampling_tick_counter++;
 
@@ -628,6 +642,7 @@ void DMA1_Channel1_IRQHandler(void)
             if (snapshot_collecting && snapshot_write_index < SNAPSHOT_SIZE)
             {
                 snapshot_buffer_high[snapshot_write_index] = ch0_value;
+                snapshot_buffer_low[snapshot_write_index] = ch1_value;
                 snapshot_write_index++;
                 if (snapshot_write_index >= SNAPSHOT_SIZE)
                 {
@@ -635,12 +650,6 @@ void DMA1_Channel1_IRQHandler(void)
                     snapshot_collecting = 0;
                 }
             }
-            
-            /* 处理PA1数据：只写入环形缓冲区，不写入快照缓冲区 */
-            uint16_t ch1_value = AD_Value[i * 2 + 1];  // PA1数据
-            uint16_t ch1_index = ring_write_index_ch1;
-            adc_ring_buffer_ch1[ch1_index] = ch1_value;
-            ring_write_index_ch1 = (ch1_index + 1) % RING_BUFFER_SIZE;
         }
         /* 更新Keil Array Visualization可视化数组：将最新的500个通道0数据复制到可视化缓冲区 */
         {

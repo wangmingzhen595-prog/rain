@@ -10,6 +10,7 @@
 #include "stm32f10x_iwdg.h"              // 独立看门狗头文件（用于死机自启动）
 #include "TF_Comm.h"                     // TF通信模块头文件
 #include "SPI_SlaveLink.h"               // SPI 从机链路层（SPI1 + EXTI4）
+#include "RainAreaBuffer.h"
 #include "Wavelet.h"                     // 小波变换模块头文件
 #include "raindrop.h"                    // 雨滴体积换算模块头文件
 
@@ -19,16 +20,17 @@
 
 // ========== 系统参数定义 ==========
 /* 电压校准系数（方便修改） */
-#define ADC_VOLTAGE_CALIBRATION_FACTOR  0.9155f  // 电压校准系数（示波器2.60V对应单片机2.84V：2.60/2.84≈0.9155）
-#define ADC_VOLTAGE_CALIBRATION_NUM     9155UL   // 同一校准系数的整数分子，用于积分计算，避免主循环里用浮点累加
-#define ADC_VOLTAGE_CALIBRATION_DEN     10000UL  // 同一校准系数的整数分母：9155/10000=0.9155
+#define ADC_VOLTAGE_CALIBRATION_FACTOR  1.0f     // 电压不再全局缩小，按3.3V参考值换算
+#define ADC_VOLTAGE_CALIBRATION_NUM     1UL      // 同一校准系数的整数分子，用于积分计算
+#define ADC_VOLTAGE_CALIBRATION_DEN     1UL      // 同一校准系数的整数分母：1/1=1.0
 #define ADC_REF_MV                      3300UL   // ADC参考电压，单位mV
 
 /* PA1通道配置：用于PA0接近饱和时切换（测量大于3.3V的雨滴） */
 #define PA0_SWITCH_TO_PA1_HIGH    4095     // PA0切换到PA1的阈值（3.3V，ADC满量程，当PA0饱和时切换）
 #define PA0_SWITCH_TO_PA1_LOW     3500     // PA0切回PA0的阈值（低阈值，滞回下限，约2.85V）
 #define PA0_SATURATION_THRESHOLD  4095     // PA0饱和阈值（3.3V，ADC满量程，保留用于兼容）
-#define PA1_AMPLIFICATION_FACTOR  1.0f     // PA1放大倍数（默认1.0，后续根据实际信号测试调整）
+#define PA1_AMPLIFICATION_FACTOR  100.0f   // PA1等效放大倍数占位，实际积分使用PA1_GAIN_RATIO_X100定点倍率
+#define PA1_GAIN_RATIO_X100       10000UL  // PA1等效放大倍率，100.00倍；后续需要用实验标定修正
 #define PA1_VOLTAGE_CALIBRATION_FACTOR  0.701f  // PA1电压校准系数（示波器2.84V对应程序显示4.05V：2.84/4.05≈0.701）
 #define PA1_MIN_VALID_VALUE       50       // PA1最小有效值（噪声阈值，低于此值认为PA1无效）
 #define PA1_VALID_MARGIN          100      // PA1有效性判断余量（pa1_raw必须大于噪声基线+余量才有效，避免固定偏置误判）
@@ -42,6 +44,7 @@
 #define HIGH_GAIN_FACTOR         15.0f
 #define LOW_GAIN_FACTOR          1.0f
 #define HIGH_GAIN_SAT_THRESHOLD  4000     // 高增益ADC达到该值视为饱和（接近3.3V）
+#define HIGH_GAIN_SAT_COUNT_TH   3        // PA0连续达到饱和阈值的样本数，达到后本事件改用PA1积分
 #define ADC_FULL_SCALE           4095     // ADC满量程值（12位ADC，明确写死为4095，防止未来换ADC分辨率出坑）
 #define ADC_REF_VOLTAGE          3.3f
 
@@ -243,8 +246,6 @@ static float Compute_Intensity_MMH(void); // 计算降雨强度（mm/h）
 static int32_t Compute_Baseline(uint16_t *buf, uint16_t len);
 static int32_t Compute_Wavelet_Baseline(uint16_t trigger_index); // 计算小波baseline（从预触发环形缓冲区）
 static float Compute_Voltage_From_ADC(uint16_t adc_value);  // 从ADC值计算电压（应用校准系数）
-static uint16_t Compute_PA1_Noise_Baseline(uint16_t pa1_ring_index);  // 计算PA1噪声基线（事件前的窗口）
-static inline uint32_t Scale_Clamp_PA1(uint16_t raw);  // PA1放大并clamp（内联函数，减少重复代码）
 static void Find_Peak_In_Buffer(uint16_t *buf, uint16_t len, int32_t baseline,
                                 uint16_t *peak_index, uint16_t *peak_value,
                                 uint16_t search_start, uint16_t search_end);
@@ -260,6 +261,15 @@ static uint8_t Build_MainPulse_Features_From_Segment(uint16_t *buf, uint16_t len
                                                      MainPulseFeatures_t *features);
 static uint16_t Clamp_U16_From_I32(int32_t value);
 static uint16_t Clamp_ADC_Delta_From_I32(int32_t value);
+static uint32_t Clamp_U64_To_U32(uint64_t value);
+static uint16_t Count_Max_Consecutive_Saturation(uint16_t *buf, uint16_t len);
+static void Integrate_Delta_Window_ADC_us(uint16_t *buf, uint16_t start_index,
+                                          uint16_t end_index, int32_t baseline,
+                                          uint32_t gain_x100,
+                                          uint32_t *area_samples,
+                                          uint32_t *raw_integral_adc_us,
+                                          uint32_t *scaled_integral_adc_us);
+static uint16_t Scale_PA1_Delta_To_U16(uint16_t raw, int32_t baseline);
 static uint32_t Integrate_MainPulse_mV_us(uint16_t *buf, uint16_t start_index,
                                           uint16_t end_index, int32_t baseline);
 static void Update_MainPulse_Display_State(MainPulseFeatures_t *features);
@@ -343,6 +353,13 @@ char  last_gain_used = 'H';         // 最近一次使用的增益通道（'H'�
 volatile uint32_t watchdog_trigger_count = 0; // 模拟看门狗触发次数
 volatile uint32_t snapshot_valid_count = 0;   // 验证通过次数
 
+volatile uint16_t dbg_event_source_channel = 0;
+volatile uint16_t dbg_event_max_sat_count = 0;
+volatile uint32_t dbg_event_raw_integral_adc_us = 0;
+volatile uint32_t dbg_event_scaled_integral_adc_us = 0;
+volatile uint16_t dbg_event_gain_x100 = 0;
+volatile uint16_t dbg_event_flags = 0;
+
 /**
   * @brief  主函数
   * @param  无
@@ -357,6 +374,7 @@ int main(void)
     AD_Init();                           // 初始化ADC和DMA，配置连续采样模式
     AD_SetThreshold(THRESHOLD);          // 设置模拟看门狗阈值
     USART1_Config();                     // 初始化USART1串口（PA10=TX，PA9=RX，115200 8N1）
+    RainAreaBuffer_Init();
     /* SPI 从站链路层初始化（SPI1，PA4=NSS，PA5=SCK，PA6=MISO，PA7=MOSI） */
     SPI_SlaveLink_Init(MODBUS_SLAVE_ID);
     Raindrop_Init();                     // 初始化雨滴体积换算模块
@@ -897,270 +915,89 @@ static void Process_Snapshot_IfReady(void)
 	Find_Peak_In_Buffer((uint16_t *)snapshot_buffer_high, len, baseline_high,
 	                    &full_peak_index, &full_peak_value, 0, (uint16_t)(len - 1));
 
-	/* PA0/PA1切换逻辑（带滞回，避免反复切换） */
-	// 切换判定使用 full_peak_value（全窗口峰值），而不是仅限前部窗口的 front/active 峰值
-	uint16_t switch_peak_value = full_peak_value;  // 用于切换判断的峰值（全快照范围）
-	
-	// 调试输出：进入切换逻辑
-	USART1_SendString("=== Switch Logic ===\r\n");
-	USART1_SendString("full_peak_value=");
-	USART1_SendUint32(full_peak_value);
-	USART1_SendString(", front_peak_value=");
-	USART1_SendUint32(front_peak_value);
-	USART1_SendString(", HIGH=");
-	USART1_SendUint32(PA0_SWITCH_TO_PA1_HIGH);
-	USART1_SendString("\r\n");
-	if (pulse_ok)
-	{
-		USART1_SendString("Pulse: area=");
-		USART1_SendUint32(pulse_features.area_pos);
-		USART1_SendString(", impulse=");
-		USART1_SendUint32(pulse_features.impulse_mv_us);
-		USART1_SendString(", energy=");
-		USART1_SendUint32(pulse_features.energy_pos);
-		USART1_SendString(", rise=");
-		USART1_SendUint32(pulse_features.rise_samples);
-		USART1_SendString(", fall=");
-		USART1_SendUint32(pulse_features.fall_samples);
-		USART1_SendString(", w20=");
-		USART1_SendUint32(pulse_features.width20_samples);
-		USART1_SendString(", w50=");
-		USART1_SendUint32(pulse_features.width50_samples);
-		USART1_SendString("\r\n");
-	}
-	
+	uint16_t max_sat_count = Count_Max_Consecutive_Saturation((uint16_t *)snapshot_buffer_high, len);
+	uint8_t pa0_saturated = (max_sat_count >= HIGH_GAIN_SAT_COUNT_TH);
+	int32_t baseline_low = Compute_Baseline((uint16_t *)snapshot_buffer_low, len);
+	uint16_t pa1_peak_index = start_index;
+	uint16_t pa1_peak_raw = snapshot_buffer_low[start_index];
+	uint16_t pa1_peak_delta;
+	uint8_t use_pa1;
 	uint16_t final_peak_value = front_peak_value;
-	uint8_t should_use_pa1 = 0;
-	uint16_t pa1_raw = 0;      // PA1原始数据
-	uint32_t pa1_scaled = 0;   // PA1放大后的数据
-	
-	// 读取PA1数据（用于判断是否有效）
-	extern volatile uint16_t adc_ring_buffer_ch1[RING_BUFFER_SIZE];
-	extern volatile uint16_t ring_write_index_ch1;
-	extern volatile uint16_t snapshot_trigger_index_ch0;  // 快照触发时的PA0索引
-	
-	/* 计算PA1数据对应的环形缓冲区索引 */
-	/* 关键：使用 full_peak_index（全窗口峰值索引），确保PA1读取的位置对应真正的大峰时刻 */
-	/* 快照索引full_peak_index，其中SNAPSHOT_PRE_SAMPLES(200)是触发点 */
-	/* 快照索引相对于触发点的偏移：full_peak_index - SNAPSHOT_PRE_SAMPLES */
-	int16_t offset_from_trigger = (int16_t)full_peak_index - (int16_t)SNAPSHOT_PRE_SAMPLES;
-	
-	/* 计算PA0对应的环形缓冲区索引（用于验证，实际使用active_peak_index对应的PA1数据） */
-	int16_t pa0_ring_index = (int16_t)snapshot_trigger_index_ch0 + offset_from_trigger;
-	if (pa0_ring_index < 0)
+	uint16_t event_source_channel = RAIN_AREA_SOURCE_PA0;
+	uint16_t event_flags = RAIN_AREA_FLAG_RAW_VALID | RAIN_AREA_FLAG_SCALED_VALID;
+	uint16_t event_gain_x100 = 100U;
+	uint32_t event_area_samples = pulse_ok ? pulse_features.area_pos : current_pulse_area;
+	uint32_t raw_integral_adc_us;
+	uint32_t scaled_integral_adc_us;
+	uint16_t event_peak_adc = front_peak_value;
+	uint16_t event_baseline_adc = Clamp_U16_From_I32(active_baseline);
+
+	if (end_index >= start_index)
 	{
-		pa0_ring_index += RING_BUFFER_SIZE;
-	}
-	pa0_ring_index = pa0_ring_index % RING_BUFFER_SIZE;
-	
-	/* PA1和PA0同步采集，索引相同（ring_write_index_ch0和ring_write_index_ch1在同一个DMA中断中同步递增） */
-	/* 因此PA1对应的环形缓冲区索引与PA0相同 */
-	uint16_t pa1_ring_index = (uint16_t)pa0_ring_index;
-	
-	pa1_raw = adc_ring_buffer_ch1[pa1_ring_index];
-	
-	// 调试输出：PA1数据读取信息
-	USART1_SendString("PA1 Read: full_peak_idx=");
-	USART1_SendUint32(full_peak_index);
-	USART1_SendString(", front_peak_idx=");
-	USART1_SendUint32(front_peak_index);
-	USART1_SendString(", offset=");
-	USART1_SendUint32((uint32_t)offset_from_trigger);
-	USART1_SendString(", pa1_ring_idx=");
-	USART1_SendUint32(pa1_ring_index);
-	USART1_SendString(", pa1_raw=");
-	USART1_SendUint32(pa1_raw);
-	USART1_SendString("\r\n");
-	
-	// 计算PA1噪声基线（用于有效性判断，避免固定偏置误判）
-	uint16_t pa1_baseline = Compute_PA1_Noise_Baseline(pa1_ring_index);
-	
-	// 滞回切换逻辑（优化版：只在切换点判断PA1有效性）
-	// 初始化：确保pa1_scaled有明确初始值
-	pa1_scaled = 0;
-	should_use_pa1 = 0;
-	
-	// PA1连续无效计数器（用于避免单点失效导致跳变）
-	static uint8_t pa1_invalid_cnt = 0;
-	
-	// 当前是否使用PA1（静态变量，在事件之间保持状态）
-	static uint8_t use_pa1 = 0;
-	
-	// 调试输出：当前状态
-	USART1_SendString("Current use_pa1=");
-	USART1_SendUint32(use_pa1 ? 1 : 0);
-	USART1_SendString("\r\n");
-	
-	if (!use_pa1)
-	{
-		// 当前使用PA0，检查是否需要切换到PA1
-		// 使用active_peak_value（原始峰值）判断，而不是front_peak_value（前部窗口峰值）
-		
-		// 调试输出：检查是否进入切换判断
-		USART1_SendString("Check Switch: switch_peak=");
-		USART1_SendUint32(switch_peak_value);
-		USART1_SendString(", HIGH=");
-		USART1_SendUint32(PA0_SWITCH_TO_PA1_HIGH);
-		USART1_SendString(", condition=");
-		USART1_SendUint32((switch_peak_value >= PA0_SWITCH_TO_PA1_HIGH) ? 1 : 0);
-		USART1_SendString("\r\n");
-		
-		if (switch_peak_value >= PA0_SWITCH_TO_PA1_HIGH)
+		for (uint16_t i = start_index; i <= end_index; i++)
 		{
-			USART1_SendString("*** ENTER SWITCH LOGIC ***\r\n");
-			
-			// PA0接近饱和，检查PA1是否有效（简化判断：只要PA1有合理的ADC值就切换）
-			// 简化有效性判断：只要PA1的ADC值大于最小值，就认为有效
-			// 因为PA1和PA0是同步采集的，如果PA0有信号，PA1也应该有对应的信号
-			uint8_t pa1_valid = (pa1_raw >= PA1_MIN_VALID_VALUE);
-			
-			// 调试输出：切换判断信息
-			USART1_SendString("Switch: switch_peak=");
-			USART1_SendUint32(switch_peak_value);
-			USART1_SendString(", front_peak=");
-			USART1_SendUint32(front_peak_value);
-			USART1_SendString(", pa1_raw=");
-			USART1_SendUint32(pa1_raw);
-			USART1_SendString(", pa1_baseline=");
-			USART1_SendUint32(pa1_baseline);
-			USART1_SendString(", valid=");
-			USART1_SendUint32(pa1_valid ? 1 : 0);
-			USART1_SendString("\r\n");
-			
-			// 如果PA1有效，切换到PA1
-			if (pa1_valid)
+			if (snapshot_buffer_low[i] > pa1_peak_raw)
 			{
-				// 使用内联函数计算PA1放大值并clamp
-				pa1_scaled = Scale_Clamp_PA1(pa1_raw);
-				
-				if (pa1_scaled > 0 && pa1_scaled <= PA1_MAX_SCALED_VALUE)
-				{
-					should_use_pa1 = 1;
-					pa1_invalid_cnt = 0;  // 重置无效计数器
-					USART1_SendString("Switch: ->PA1, pa1_raw=");
-					USART1_SendUint32(pa1_raw);
-					USART1_SendString(", scaled=");
-					USART1_SendUint32(pa1_scaled);
-					USART1_SendString("\r\n");
-				}
-				else
-				{
-					USART1_SendString("Switch: PA1 scaled invalid, scaled=");
-					USART1_SendUint32(pa1_scaled);
-					USART1_SendString("\r\n");
-				}
-			}
-			else
-			{
-				USART1_SendString("Switch: PA1 invalid (pa1_raw < MIN_VALID), pa1_raw=");
-				USART1_SendUint32(pa1_raw);
-				USART1_SendString("\r\n");
-			}
-		}
-		else
-		{
-			USART1_SendString("Switch: condition not met, switch_peak < HIGH\r\n");
-		}
-	}
-	else
-	{
-		// 当前使用PA1，检查是否需要切回PA0
-		// 优化：不再检查PA1有效性，只看PA0是否回落（避免单点噪声导致跳变）
-		// 使用active_peak_value（原始峰值）判断，而不是front_peak_value（前部窗口峰值）
-		if (switch_peak_value <= PA0_SWITCH_TO_PA1_LOW)
-		{
-			// PA0已回落，切回PA0
-			should_use_pa1 = 0;
-			pa1_invalid_cnt = 0;  // 重置无效计数器
-		}
-		else
-		{
-			// 继续使用PA1（不再检查PA1有效性，避免单点噪声导致跳变）
-			// 使用内联函数重新计算PA1放大值用于显示
-			pa1_scaled = Scale_Clamp_PA1(pa1_raw);
-			
-			// 连续失效保险：如果PA1连续多次失效，才回退PA0（避免单点失效导致跳变）
-			if (pa1_scaled == 0)
-			{
-				pa1_invalid_cnt++;
-			}
-			else
-			{
-				pa1_invalid_cnt = 0;  // 重置无效计数器
-			}
-			
-			if (pa1_invalid_cnt >= PA1_INVALID_COUNT_THRESHOLD)
-			{
-				// 连续3次无效，切回PA0
-				should_use_pa1 = 0;
-				pa1_invalid_cnt = 0;
-			}
-			else if (pa1_scaled > 0 && pa1_scaled <= PA1_MAX_SCALED_VALUE)
-			{
-				should_use_pa1 = 1;
-			}
-			else
-			{
-				// PA1放大后超出范围，切回PA0
-				should_use_pa1 = 0;
+				pa1_peak_raw = snapshot_buffer_low[i];
+				pa1_peak_index = i;
 			}
 		}
 	}
-	
-	// 保险规则：只要切到PA1，就强制本轮必须成功算出pa1_scaled，否则回退PA0
-	if (should_use_pa1)
+	pa1_peak_delta = Clamp_ADC_Delta_From_I32((int32_t)pa1_peak_raw - baseline_low);
+	use_pa1 = (uint8_t)(pa0_saturated && (pa1_peak_delta >= PA1_MIN_VALID_VALUE));
+
+	if (pa0_saturated)
 	{
-		if (pa1_scaled == 0 || pa1_scaled > PA1_MAX_SCALED_VALUE)
-		{
-			// pa1_scaled未正确计算，强制回退PA0
-			should_use_pa1 = 0;
-		}
+		event_flags |= RAIN_AREA_FLAG_PA0_SAT;
 	}
-	
-	// 应用切换结果
-	use_pa1 = should_use_pa1;
-	
-	// 调试输出：切换结果
-	USART1_SendString("Result: should_use_pa1=");
-	USART1_SendUint32(should_use_pa1 ? 1 : 0);
-	USART1_SendString(", use_pa1=");
-	USART1_SendUint32(use_pa1 ? 1 : 0);
-	USART1_SendString(", pa1_scaled=");
-	USART1_SendUint32(pa1_scaled);
-	USART1_SendString("\r\n");
-	
+
 	if (use_pa1)
 	{
-		// 确保pa1_scaled已正确计算
-		final_peak_value = (pa1_scaled > 65535) ? 65535 : (uint16_t)pa1_scaled;
-		last_gain_used = 'L';  // 'L'表示PA1通道（低增益，用于大信号）
-		// 调试输出：成功切换到PA1
-		USART1_SendString("*** PA1 Active *** switch_peak=");
-		USART1_SendUint32(switch_peak_value);
-		USART1_SendString(", front_peak=");
-		USART1_SendUint32(front_peak_value);
-		USART1_SendString(", pa1_raw=");
-		USART1_SendUint32(pa1_raw);
-		USART1_SendString(", pa1_scaled=");
-		USART1_SendUint32(pa1_scaled);
-		USART1_SendString(", final=");
-		USART1_SendUint32(final_peak_value);
-		USART1_SendString("\r\n");
+		Integrate_Delta_Window_ADC_us((uint16_t *)snapshot_buffer_low,
+		                              start_index,
+		                              end_index,
+		                              baseline_low,
+		                              PA1_GAIN_RATIO_X100,
+		                              &event_area_samples,
+		                              &raw_integral_adc_us,
+		                              &scaled_integral_adc_us);
+		final_peak_value = Scale_PA1_Delta_To_U16(pa1_peak_raw, baseline_low);
+		event_peak_adc = final_peak_value;
+		event_baseline_adc = Clamp_U16_From_I32(baseline_low);
+		event_source_channel = RAIN_AREA_SOURCE_PA1;
+		event_gain_x100 = (uint16_t)PA1_GAIN_RATIO_X100;
+		event_flags |= RAIN_AREA_FLAG_USE_PA1;
+		last_gain_used = 'L';
 	}
 	else
 	{
-		final_peak_value = front_peak_value;
-		last_gain_used = 'H';  // 'H'表示PA0高增益通道
-		// 调试输出：使用PA0（如果PA0值较高）
-		if (front_peak_value >= 3500)
-		{
-			USART1_SendString("PA0 Active: peak=");
-			USART1_SendUint32(front_peak_value);
-			USART1_SendString(" (high, no switch)\r\n");
-		}
+		uint64_t area_adc_us64 = ((uint64_t)event_area_samples * (uint64_t)ADC_SAMPLE_INTERVAL_NS + 500ULL) / 1000ULL;
+
+		raw_integral_adc_us = Clamp_U64_To_U32(area_adc_us64);
+		scaled_integral_adc_us = raw_integral_adc_us;
+		last_gain_used = 'H';
 	}
-	
-	USART1_SendString("==================\r\n");
+
+	dbg_event_source_channel = event_source_channel;
+	dbg_event_max_sat_count = max_sat_count;
+	dbg_event_raw_integral_adc_us = raw_integral_adc_us;
+	dbg_event_scaled_integral_adc_us = scaled_integral_adc_us;
+	dbg_event_gain_x100 = event_gain_x100;
+	dbg_event_flags = event_flags;
+
+	USART1_SendString("Switch: sat=");
+	USART1_SendUint32(max_sat_count);
+	USART1_SendString(", use_pa1=");
+	USART1_SendUint32(use_pa1 ? 1 : 0);
+	USART1_SendString(", pa1_peak_idx=");
+	USART1_SendUint32(pa1_peak_index);
+	USART1_SendString(", pa1_delta=");
+	USART1_SendUint32(pa1_peak_delta);
+	USART1_SendString(", raw_int=");
+	USART1_SendUint32(raw_integral_adc_us);
+	USART1_SendString(", scaled_int=");
+	USART1_SendUint32(scaled_integral_adc_us);
+	USART1_SendString("\r\n");
 
 	if (count_allowed &&
 	    Validate_And_Count_Event(active_buffer, end_index + 1, front_peak_index, front_peak_value, threshold, start_index, end_index))
@@ -1309,17 +1146,7 @@ static void Process_Snapshot_IfReady(void)
 		
 		/* 雨滴体积换算：对所有通过Validate_And_Count_Event的事件都进行体积换算 */
 		/* 根据使用的通道选择正确的ADC峰值 */
-		uint16_t adc_peak_for_volume;
-		if (use_pa1)
-		{
-			/* PA1通道：使用原始ADC值pa1_raw（未放大） */
-			adc_peak_for_volume = pa1_raw;
-		}
-		else
-		{
-			/* PA0通道：使用front_peak_value */
-			adc_peak_for_volume = front_peak_value;
-		}
+		uint16_t adc_peak_for_volume = use_pa1 ? final_peak_value : front_peak_value;
 		
 		/* 直接计算体积并累加（绕过死区时间，确保每次事件都累加） */
 		/* 先计算电压（mV） */
@@ -1359,15 +1186,46 @@ static void Process_Snapshot_IfReady(void)
 			{
 				drops_per_second[sec_index] += 1; // 当前秒雨滴数加1
 			}
+
+			{
+				RainAreaEvent_t area_evt;
+				uint16_t pulse_width = pulse_ok ?
+					(uint16_t)(pulse_features.pulse_end - pulse_features.pulse_start + 1U) :
+					current_pulse_width;
+
+				if (pulse_width == 0U)
+				{
+					pulse_width = (uint16_t)(end_index - start_index + 1U);
+				}
+
+				area_evt.seq = RainAreaBuffer_NextSeq();
+				area_evt.peak_adc = event_peak_adc;
+				area_evt.baseline_adc = event_baseline_adc;
+				area_evt.pulse_width_samples = pulse_width;
+				area_evt.area_adc_samples = event_area_samples;
+				area_evt.area_adc_us = scaled_integral_adc_us;
+				area_evt.flags = event_flags;
+				area_evt.source_channel = event_source_channel;
+				area_evt.max_sat_count = max_sat_count;
+				area_evt.gain_x100 = event_gain_x100;
+				area_evt.raw_integral_adc_us = raw_integral_adc_us;
+				area_evt.scaled_integral_adc_us = scaled_integral_adc_us;
+
+				RainAreaBuffer_UpdateLatest(&area_evt);
+				if (!RainAreaBuffer_Push(&area_evt))
+				{
+					RainAreaBuffer_RecordOverflow();
+				}
+			}
 		}
 		
 		// TF通信上传（非阻塞，队列入队）
 		// 注意：src_id参数已删除，SRC_ID字段统一使用编译时宏TF_SRC_ID
 		// ENERGY计算：使用pulse_samples明确样本数口径
 		uint16_t pulse_samples = end_index - start_index + 1;  // 用于ENERGY的样本数口径
-		uint32_t energy = pulse_ok ? pulse_features.area_pos :
-			((uint32_t)front_peak_value * (uint32_t)pulse_samples);
-		TF_Comm_SendEvent(1, front_peak_value, energy, 
+		uint32_t energy = use_pa1 ? event_area_samples : (pulse_ok ? pulse_features.area_pos :
+			((uint32_t)front_peak_value * (uint32_t)pulse_samples));
+		TF_Comm_SendEvent(1, final_peak_value, energy, 
 		                 (use_pa1 ? 1 : 0), wavelet_done);
 	}
 
@@ -1892,42 +1750,6 @@ static int32_t Compute_Baseline(uint16_t *buf, uint16_t len)
 }
 
 /**
-  * @brief  计算PA1噪声基线（事件前的窗口）
-  * @param  pa1_ring_index: PA1当前环形缓冲区索引
-  * @retval PA1噪声基线值
-  * @note   取事件前的32点均值作为噪声基线，用于有效性判断
-  */
-static uint16_t Compute_PA1_Noise_Baseline(uint16_t pa1_ring_index)
-{
-	extern volatile uint16_t adc_ring_buffer_ch1[RING_BUFFER_SIZE];
-	uint32_t sum = 0;
-	
-	for (int k = 0; k < PA1_BASELINE_WINDOW; k++)
-	{
-		int idx = (int)pa1_ring_index - 1 - k;
-		if (idx < 0) idx += RING_BUFFER_SIZE;
-		idx = idx % RING_BUFFER_SIZE;
-		sum += adc_ring_buffer_ch1[idx];
-	}
-	
-	return (uint16_t)(sum / PA1_BASELINE_WINDOW);
-}
-
-/**
-  * @brief  PA1放大并clamp（内联函数，减少重复代码）
-  * @param  raw: PA1原始ADC值
-  * @retval 放大后的值（已clamp到0-65535）
-  * @note   统一处理放大和溢出保护，避免重复代码
-  */
-static inline uint32_t Scale_Clamp_PA1(uint16_t raw)
-{
-	float x = (float)raw * PA1_AMPLIFICATION_FACTOR;
-	if (x <= 0.0f) return 0;
-	if (x >= 65535.0f) return 65535;
-	return (uint32_t)(x + 0.5f);  // 四舍五入
-}
-
-/**
   * @brief  从ADC值计算电压（应用校准系数）
   * @param  adc_value: ADC原始值
   * @retval 计算后的电压值（伏特）
@@ -2077,6 +1899,107 @@ static uint16_t Clamp_ADC_Delta_From_I32(int32_t value)
 		return (uint16_t)ADC_FULL_SCALE;
 	}
 	return delta;
+}
+
+static uint32_t Clamp_U64_To_U32(uint64_t value)
+{
+	if (value > 0xFFFFFFFFULL)
+	{
+		return 0xFFFFFFFFUL;
+	}
+	return (uint32_t)value;
+}
+
+static uint16_t Count_Max_Consecutive_Saturation(uint16_t *buf, uint16_t len)
+{
+	uint16_t max_count = 0;
+	uint16_t current_count = 0;
+
+	if (buf == 0)
+	{
+		return 0;
+	}
+
+	for (uint16_t i = 0; i < len; i++)
+	{
+		if (buf[i] >= HIGH_GAIN_SAT_THRESHOLD)
+		{
+			current_count++;
+			if (current_count > max_count)
+			{
+				max_count = current_count;
+			}
+		}
+		else
+		{
+			current_count = 0;
+		}
+	}
+
+	return max_count;
+}
+
+static void Integrate_Delta_Window_ADC_us(uint16_t *buf, uint16_t start_index,
+                                          uint16_t end_index, int32_t baseline,
+                                          uint32_t gain_x100,
+                                          uint32_t *area_samples,
+                                          uint32_t *raw_integral_adc_us,
+                                          uint32_t *scaled_integral_adc_us)
+{
+	uint64_t area_sum = 0;
+	uint64_t raw_ns_sum = 0;
+	uint64_t scaled_ns_x100_sum = 0;
+
+	if (area_samples)
+	{
+		*area_samples = 0;
+	}
+	if (raw_integral_adc_us)
+	{
+		*raw_integral_adc_us = 0;
+	}
+	if (scaled_integral_adc_us)
+	{
+		*scaled_integral_adc_us = 0;
+	}
+	if (buf == 0 || end_index < start_index)
+	{
+		return;
+	}
+
+	for (uint16_t i = start_index; i <= end_index; i++)
+	{
+		uint16_t delta = Clamp_ADC_Delta_From_I32((int32_t)buf[i] - baseline);
+
+		area_sum += delta;
+		raw_ns_sum += (uint64_t)delta * (uint64_t)ADC_SAMPLE_INTERVAL_NS;
+		scaled_ns_x100_sum += (uint64_t)delta * (uint64_t)gain_x100 * (uint64_t)ADC_SAMPLE_INTERVAL_NS;
+	}
+
+	if (area_samples)
+	{
+		*area_samples = Clamp_U64_To_U32(area_sum);
+	}
+	if (raw_integral_adc_us)
+	{
+		*raw_integral_adc_us = Clamp_U64_To_U32((raw_ns_sum + 500ULL) / 1000ULL);
+	}
+	if (scaled_integral_adc_us)
+	{
+		*scaled_integral_adc_us = Clamp_U64_To_U32((scaled_ns_x100_sum + 50000ULL) / 100000ULL);
+	}
+}
+
+static uint16_t Scale_PA1_Delta_To_U16(uint16_t raw, int32_t baseline)
+{
+	uint16_t delta = Clamp_ADC_Delta_From_I32((int32_t)raw - baseline);
+	uint64_t scaled = ((uint64_t)delta * (uint64_t)PA1_GAIN_RATIO_X100 + 50ULL) / 100ULL;
+
+	if (scaled > 65535ULL)
+	{
+		return 65535U;
+	}
+	return (uint16_t)scaled;
 }
 
 static uint32_t Integrate_MainPulse_mV_us(uint16_t *buf, uint16_t start_index,
