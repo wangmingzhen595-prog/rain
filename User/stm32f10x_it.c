@@ -59,6 +59,8 @@
 #define DIFF_TRIGGER_CONSEC         2     // 连续满足差分阈值的样本数
 #define DIFF_TRIGGER_COOLDOWN       150   // 触发后冷却样本数，避免重复触发
 
+#define LIVE_SAT_THRESHOLD          4000
+
 /** @addtogroup STM32F10x_StdPeriph_Template
   * @{
   */
@@ -229,6 +231,39 @@ static void UpdateBaseline(PeakDetectorContext *ctx, uint16_t value)
 }
 
 static void Start_Watchdog_Snapshot(void);
+static void Update_Live_Diagnostics(uint16_t ch0_value, uint16_t ch1_value)
+{
+    extern volatile uint16_t dbg_live_pa0_max;
+    extern volatile uint16_t dbg_live_pa1_max;
+    extern volatile uint16_t dbg_live_pa0_sat_run;
+    extern volatile uint16_t dbg_live_pa0_sat_max;
+
+    if (ch0_value > dbg_live_pa0_max)
+    {
+        dbg_live_pa0_max = ch0_value;
+    }
+    if (ch1_value > dbg_live_pa1_max)
+    {
+        dbg_live_pa1_max = ch1_value;
+    }
+
+    if (ch0_value >= LIVE_SAT_THRESHOLD)
+    {
+        if (dbg_live_pa0_sat_run < 0xFFFFU)
+        {
+            dbg_live_pa0_sat_run++;
+        }
+        if (dbg_live_pa0_sat_run > dbg_live_pa0_sat_max)
+        {
+            dbg_live_pa0_sat_max = dbg_live_pa0_sat_run;
+        }
+    }
+    else
+    {
+        dbg_live_pa0_sat_run = 0;
+    }
+}
+
 static void Process_ADC_Sample(uint8_t channel, uint16_t value, uint16_t ring_index)
 {
     extern volatile uint16_t dynamic_threshold;
@@ -591,6 +626,7 @@ void DMA1_Channel1_IRQHandler(void)
             dbg_pair_pa1_last = ch1_value;
             dbg_pair_write_idx = current_index;
             dbg_pair_write_count++;
+            Update_Live_Diagnostics(ch0_value, ch1_value);
             Process_ADC_Sample(0, ch0_value, current_index);
             sampling_tick_counter++;
 
@@ -634,6 +670,7 @@ void DMA1_Channel1_IRQHandler(void)
             dbg_pair_pa1_last = ch1_value;
             dbg_pair_write_idx = current_index;
             dbg_pair_write_count++;
+            Update_Live_Diagnostics(ch0_value, ch1_value);
             Process_ADC_Sample(0, ch0_value, current_index);
             sampling_tick_counter++;
 
