@@ -46,6 +46,23 @@
 #define PA1_GAIN_SHIFT            7U
 #define PA1_GAIN_MULTIPLIER       (1UL << PA1_GAIN_SHIFT)
 #define PA1_GAIN_RATIO_X100       (PA1_GAIN_MULTIPLIER * 100UL)
+#define PA1_SCALE_SHIFT           4U
+#define PA1_VALID_MIN_MV          150UL
+#define PA1_VALID_MAX_MV          450UL
+#define EVENT_EQ_MAX_MV           6000UL
+#define EVENT_CLIP_MV             3300UL
+#define PA0_CLIP_ADC              4090U
+#define PA0_CLIP_COUNT_TH         3U
+
+#define EVENT_RESULT_SOURCE_PA0   0U
+#define EVENT_RESULT_SOURCE_PA1   1U
+#define EVENT_RESULT_SOURCE_CLIP  2U
+#define EVENT_RESULT_FLAG_VALID       0x0001U
+#define EVENT_RESULT_FLAG_PA0_CLIPPED 0x0002U
+#define EVENT_RESULT_FLAG_PA1_VALID   0x0004U
+#define EVENT_RESULT_FLAG_PA1_LOW     0x0008U
+#define EVENT_RESULT_FLAG_PA1_HIGH    0x0010U
+#define EVENT_RESULT_FLAG_EQ_LIMIT    0x0020U
 #define PA1_VOLTAGE_CALIBRATION_FACTOR  0.701f  // PA1电压校准系数（示波器2.84V对应程序显示4.05V：2.84/4.05≈0.701）
 #define PA1_MIN_VALID_VALUE       50       // PA1最小有效值（噪声阈值，低于此值认为PA1无效）
 #define PA1_VALID_MARGIN          100      // PA1有效性判断余量（pa1_raw必须大于噪声基线+余量才有效，避免固定偏置误判）
@@ -254,6 +271,19 @@ typedef struct
 	uint32_t energy_pos;
 } MainPulseFeatures_t;
 
+typedef struct
+{
+	uint16_t source;
+	uint8_t valid_flag;
+	uint16_t flags;
+	uint32_t old_pa0_peak_mv;
+	uint32_t old_pa0_impulse_mv_us;
+	uint32_t peak_mv;
+	uint32_t impulse_mv_us;
+	uint32_t pa1_peak_mv;
+	uint32_t pa1_impulse_mv_us;
+} RainEventResult_t;
+
 // ========== 函数声明 ==========
 void Update_Display(void);               // 显示更新函数声明
 void Check_System_Status(void);          // 系统状态检查函数声明
@@ -282,6 +312,14 @@ static uint8_t Build_MainPulse_Features_From_Segment(uint16_t *buf, uint16_t len
 static uint16_t Clamp_U16_From_I32(int32_t value);
 static uint16_t Clamp_ADC_Delta_From_I32(int32_t value);
 static uint32_t Clamp_U64_To_U32(uint64_t value);
+static uint32_t ADC_Count_To_mV(uint32_t adc_value);
+static uint32_t ADC_us_To_mV_us(uint32_t adc_us);
+static uint16_t Count_Consecutive_AtOrAbove(uint16_t *buf, uint16_t len, uint16_t threshold);
+static RainEventResult_t Build_Event_Result(uint8_t pa0_clipped,
+                                            uint32_t pa0_peak_mv,
+                                            uint32_t pa0_impulse_mv_us,
+                                            uint32_t pa1_peak_mv,
+                                            uint32_t pa1_impulse_mv_us);
 static uint16_t Count_Max_Consecutive_Saturation(uint16_t *buf, uint16_t len);
 static void Integrate_Delta_Window_ADC_us(uint16_t *buf, uint16_t start_index,
                                           uint16_t end_index, int32_t baseline,
@@ -390,6 +428,15 @@ volatile uint16_t dbg_live_pa0_max = 0;
 volatile uint16_t dbg_live_pa1_max = 0;
 volatile uint16_t dbg_live_pa0_sat_run = 0;
 volatile uint16_t dbg_live_pa0_sat_max = 0;
+static RainEventResult_t shadow_result = {0};
+static uint8_t dbg_shadow_event_pending = 0;
+static uint16_t dbg_shadow_pa0_peak_adc = 0;
+static uint16_t dbg_shadow_pa0_clip_count = 0;
+static uint16_t dbg_shadow_pa1_baseline_adc = 0;
+static uint16_t dbg_shadow_pa1_peak_adc = 0;
+static uint16_t dbg_shadow_pa1_delta_adc = 0;
+static uint16_t dbg_shadow_source = 0;
+static uint16_t dbg_shadow_flags = 0;
 
 /**
   * @brief  主函数
@@ -1020,7 +1067,8 @@ static void Process_Snapshot_IfReady(void)
 	uint16_t event_source_channel = RAIN_AREA_SOURCE_PA0;
 	uint16_t event_flags = RAIN_AREA_FLAG_RAW_VALID | RAIN_AREA_FLAG_SCALED_VALID;
 	uint16_t event_gain_x100 = 100U;
-	uint32_t event_area_samples = pulse_ok ? pulse_features.area_pos : current_pulse_area;
+	uint32_t pa0_area_samples = pulse_ok ? pulse_features.area_pos : current_pulse_area;
+	uint32_t event_area_samples = pa0_area_samples;
 	uint32_t raw_integral_adc_us;
 	uint32_t scaled_integral_adc_us;
 	uint16_t event_peak_adc = front_peak_value;
@@ -1038,7 +1086,44 @@ static void Process_Snapshot_IfReady(void)
 		}
 	}
 	pa1_peak_delta = Clamp_ADC_Delta_From_I32((int32_t)pa1_peak_raw - baseline_low);
-	use_pa1 = (uint8_t)(pa0_saturated && (pa1_peak_delta >= PA1_MIN_VALID_VALUE));
+	{
+		uint16_t shadow_pa0_clip_count = Count_Consecutive_AtOrAbove((uint16_t *)snapshot_buffer_high, len, PA0_CLIP_ADC);
+		uint8_t shadow_pa0_clipped = (uint8_t)(shadow_pa0_clip_count >= PA0_CLIP_COUNT_TH);
+		uint64_t shadow_pa0_adc_us64 = ((uint64_t)pa0_area_samples * (uint64_t)ADC_SAMPLE_INTERVAL_NS + 500ULL) / 1000ULL;
+		uint32_t shadow_pa0_adc_us = Clamp_U64_To_U32(shadow_pa0_adc_us64);
+		uint32_t shadow_pa0_peak_mv = shadow_pa0_clipped ? EVENT_CLIP_MV : ADC_Count_To_mV(front_peak_value);
+		uint32_t shadow_pa0_impulse_mv_us = pulse_ok ? pulse_features.impulse_mv_us : ADC_us_To_mV_us(shadow_pa0_adc_us);
+		uint32_t shadow_pa1_area_samples = 0;
+		uint32_t shadow_pa1_raw_adc_us = 0;
+		uint32_t shadow_pa1_scaled_adc_us = 0;
+		uint32_t shadow_pa1_peak_mv = ADC_Count_To_mV(pa1_peak_delta);
+		uint32_t shadow_pa1_impulse_mv_us;
+
+		Integrate_Delta_Window_ADC_us((uint16_t *)snapshot_buffer_low,
+		                              start_index,
+		                              end_index,
+		                              baseline_low,
+		                              &shadow_pa1_area_samples,
+		                              &shadow_pa1_raw_adc_us,
+		                              &shadow_pa1_scaled_adc_us);
+		(void)shadow_pa1_area_samples;
+		(void)shadow_pa1_scaled_adc_us;
+		shadow_pa1_impulse_mv_us = ADC_us_To_mV_us(shadow_pa1_raw_adc_us);
+		shadow_result = Build_Event_Result(shadow_pa0_clipped,
+		                                   shadow_pa0_peak_mv,
+		                                   shadow_pa0_impulse_mv_us,
+		                                   shadow_pa1_peak_mv,
+		                                   shadow_pa1_impulse_mv_us);
+		dbg_shadow_pa0_peak_adc = full_peak_value;
+		dbg_shadow_pa0_clip_count = shadow_pa0_clip_count;
+		dbg_shadow_pa1_baseline_adc = Clamp_U16_From_I32(baseline_low);
+		dbg_shadow_pa1_peak_adc = pa1_peak_raw;
+		dbg_shadow_pa1_delta_adc = pa1_peak_delta;
+		dbg_shadow_source = shadow_result.source;
+		dbg_shadow_flags = shadow_result.flags;
+		dbg_shadow_event_pending = 1U;
+	}
+	use_pa1 = (uint8_t)(shadow_result.source == EVENT_RESULT_SOURCE_PA1);
 	dbg_event_pa1_delta = pa1_peak_delta;
 
 	if (pa0_saturated)
@@ -1055,13 +1140,35 @@ static void Process_Snapshot_IfReady(void)
 		                              &event_area_samples,
 		                              &raw_integral_adc_us,
 		                              &scaled_integral_adc_us);
+		scaled_integral_adc_us = raw_integral_adc_us;
 		final_peak_value = Scale_PA1_Delta_To_U16(pa1_peak_raw, baseline_low);
 		event_peak_adc = final_peak_value;
 		event_baseline_adc = Clamp_U16_From_I32(baseline_low);
 		event_source_channel = RAIN_AREA_SOURCE_PA1;
-		event_gain_x100 = (uint16_t)PA1_GAIN_RATIO_X100;
+		event_gain_x100 = 100U;
 		event_flags |= RAIN_AREA_FLAG_USE_PA1;
 		last_gain_used = 'L';
+		{
+			uint16_t pulse_width = (uint16_t)(end_index - start_index + 1U);
+			uint64_t impulse_mv_us64 = ((uint64_t)scaled_integral_adc_us * ADC_REF_MV + (ADC_FULL_SCALE / 2U)) / ADC_FULL_SCALE;
+
+			current_peak_raw = pa1_peak_raw;
+			current_peak = final_peak_value;
+			current_voltage = Compute_Voltage_From_ADC(current_peak);
+			voltage_sum += current_voltage;
+			current_pulse_valid = 1;
+			current_pulse_area = (event_area_samples > 999999999UL) ? 999999999UL : event_area_samples;
+			current_impulse_mv_us = (impulse_mv_us64 > 0xFFFFFFFFULL) ? 0xFFFFFFFFUL : (uint32_t)impulse_mv_us64;
+			current_pulse_width = pulse_width;
+			current_pulse_rise = (front_peak_index > start_index) ? (uint16_t)(front_peak_index - start_index) : 1U;
+			current_pulse_fall = (end_index > front_peak_index) ? (uint16_t)(end_index - front_peak_index) : 1U;
+#if ENABLE_ISR_FAST_DISPLAY
+			last_valid_peak = current_peak;
+			last_update_counter = main_loop_counter;
+#endif
+			peak_hold_counter = Get_Dynamic_Peak_Hold_Time(current_peak);
+			display_counter = 20U;
+		}
 	}
 	else
 	{
@@ -1083,7 +1190,9 @@ static void Process_Snapshot_IfReady(void)
 	dbg_event_scaled_integral_adc_us = scaled_integral_adc_us;
 	dbg_event_gain_x100 = event_gain_x100;
 	dbg_event_flags = event_flags;
+	(void)pa1_peak_index;
 
+#if UART_PA1_RAW_DEBUG_TEXT
 	USART1_SendString("Switch: sat=");
 	USART1_SendUint32(max_sat_count);
 	USART1_SendString(", use_pa1=");
@@ -1097,6 +1206,7 @@ static void Process_Snapshot_IfReady(void)
 	USART1_SendString(", scaled_int=");
 	USART1_SendUint32(scaled_integral_adc_us);
 	USART1_SendString("\r\n");
+#endif
 
 	if (count_allowed &&
 	    Validate_And_Count_Event(active_buffer, end_index + 1, front_peak_index, front_peak_value, threshold, start_index, end_index))
@@ -2048,6 +2158,92 @@ static uint32_t Clamp_U64_To_U32(uint64_t value)
 	return (uint32_t)value;
 }
 
+static uint32_t ADC_Count_To_mV(uint32_t adc_value)
+{
+	uint64_t mv;
+
+	if (adc_value > ADC_FULL_SCALE)
+	{
+		adc_value = ADC_FULL_SCALE;
+	}
+
+	mv = ((uint64_t)adc_value * ADC_REF_MV * ADC_VOLTAGE_CALIBRATION_NUM +
+	      ((uint64_t)ADC_FULL_SCALE * ADC_VOLTAGE_CALIBRATION_DEN / 2ULL)) /
+	     ((uint64_t)ADC_FULL_SCALE * ADC_VOLTAGE_CALIBRATION_DEN);
+	return Clamp_U64_To_U32(mv);
+}
+
+static uint32_t ADC_us_To_mV_us(uint32_t adc_us)
+{
+	uint64_t mv_us;
+
+	mv_us = ((uint64_t)adc_us * ADC_REF_MV * ADC_VOLTAGE_CALIBRATION_NUM +
+	         ((uint64_t)ADC_FULL_SCALE * ADC_VOLTAGE_CALIBRATION_DEN / 2ULL)) /
+	        ((uint64_t)ADC_FULL_SCALE * ADC_VOLTAGE_CALIBRATION_DEN);
+	return Clamp_U64_To_U32(mv_us);
+}
+
+static uint16_t Count_Consecutive_AtOrAbove(uint16_t *buf, uint16_t len, uint16_t threshold)
+{
+	uint16_t max_count = 0;
+	uint16_t current_count = 0;
+
+	if (buf == 0)
+	{
+		return 0;
+	}
+
+	for (uint16_t i = 0; i < len; i++)
+	{
+		if (buf[i] >= threshold)
+		{
+			current_count++;
+			if (current_count > max_count)
+			{
+				max_count = current_count;
+			}
+		}
+		else
+		{
+			current_count = 0;
+		}
+	}
+
+	return max_count;
+}
+
+static RainEventResult_t Build_Event_Result(uint8_t pa0_clipped,
+                                            uint32_t pa0_peak_mv,
+                                            uint32_t pa0_impulse_mv_us,
+                                            uint32_t pa1_peak_mv,
+                                            uint32_t pa1_impulse_mv_us)
+{
+	RainEventResult_t result;
+
+	result.source = EVENT_RESULT_SOURCE_PA0;
+	result.valid_flag = 1U;
+	result.flags = EVENT_RESULT_FLAG_VALID;
+	result.old_pa0_peak_mv = pa0_peak_mv;
+	result.old_pa0_impulse_mv_us = pa0_impulse_mv_us;
+	result.peak_mv = pa0_peak_mv;
+	result.impulse_mv_us = pa0_impulse_mv_us;
+	result.pa1_peak_mv = pa1_peak_mv;
+	result.pa1_impulse_mv_us = pa1_impulse_mv_us;
+
+	if (pa0_clipped == 0U)
+	{
+		return result;
+	}
+
+	result.flags = EVENT_RESULT_FLAG_PA0_CLIPPED | EVENT_RESULT_FLAG_PA1_VALID | EVENT_RESULT_FLAG_VALID;
+	result.source = EVENT_RESULT_SOURCE_PA1;
+	result.valid_flag = 1U;
+	result.peak_mv = pa1_peak_mv;
+	result.impulse_mv_us = pa1_impulse_mv_us;
+
+	return result;
+}
+
 static uint16_t Count_Max_Consecutive_Saturation(uint16_t *buf, uint16_t len)
 {
 	uint16_t max_count = 0;
@@ -2110,7 +2306,7 @@ static void Integrate_Delta_Window_ADC_us(uint16_t *buf, uint16_t start_index,
 
 		area_sum += delta;
 		raw_ns_sum += (uint64_t)delta * (uint64_t)ADC_SAMPLE_INTERVAL_NS;
-		scaled_ns_sum += ((uint64_t)delta << PA1_GAIN_SHIFT) * (uint64_t)ADC_SAMPLE_INTERVAL_NS;
+		scaled_ns_sum += (uint64_t)delta * (uint64_t)ADC_SAMPLE_INTERVAL_NS;
 	}
 
 	if (area_samples)
@@ -2130,13 +2326,8 @@ static void Integrate_Delta_Window_ADC_us(uint16_t *buf, uint16_t start_index,
 static uint16_t Scale_PA1_Delta_To_U16(uint16_t raw, int32_t baseline)
 {
 	uint16_t delta = Clamp_ADC_Delta_From_I32((int32_t)raw - baseline);
-	uint32_t scaled = (uint32_t)delta << PA1_GAIN_SHIFT;
 
-	if (scaled > 65535UL)
-	{
-		return 65535U;
-	}
-	return (uint16_t)scaled;
+	return delta;
 }
 
 static uint32_t Integrate_MainPulse_mV_us(uint16_t *buf, uint16_t start_index,
@@ -2685,26 +2876,33 @@ static void Send_Live_Stream(void)
 {
 #if UART_VOFA_ADC_PAIR_STREAM
     {
-        uint16_t pa0_max;
-        uint16_t pa1_delta;
-        uint16_t source_channel;
-        uint32_t scaled_integral_now;
+        if (dbg_shadow_event_pending)
+        {
+            uint16_t pa0_peak_adc = dbg_shadow_pa0_peak_adc;
+            uint16_t pa0_clip_count = dbg_shadow_pa0_clip_count;
+            uint16_t pa1_baseline_adc = dbg_shadow_pa1_baseline_adc;
+            uint16_t pa1_peak_adc = dbg_shadow_pa1_peak_adc;
+            uint16_t pa1_delta_adc = dbg_shadow_pa1_delta_adc;
+            uint16_t shadow_source = dbg_shadow_source;
+            uint16_t shadow_flags = dbg_shadow_flags;
+
+            dbg_shadow_event_pending = 0U;
+
+            USART1_SendFloatPayload((float)pa0_peak_adc);
+            USART1_SendFloatPayload((float)pa0_clip_count);
+            USART1_SendFloatPayload((float)pa1_baseline_adc);
+            USART1_SendFloatPayload((float)pa1_peak_adc);
+            USART1_SendFloatPayload((float)pa1_delta_adc);
+            USART1_SendFloatPayload((float)shadow_source);
+            USART1_SendFloatPayload((float)shadow_flags);
+            USART1_SendJustFloatTail();
+        }
 
         __disable_irq();
-        pa0_max = dbg_live_pa0_max;
-        pa1_delta = dbg_event_pa1_delta;
-        source_channel = dbg_event_source_channel;
-        scaled_integral_now = dbg_event_scaled_integral_adc_us;
         dbg_live_pa0_max = 0;
         dbg_live_pa1_max = 0;
         dbg_live_pa0_sat_max = 0;
         __enable_irq();
-
-        USART1_SendFloatPayload((float)pa0_max);
-        USART1_SendFloatPayload((float)pa1_delta);
-        USART1_SendFloatPayload((float)source_channel);
-        USART1_SendFloatPayload((float)scaled_integral_now);
-        USART1_SendJustFloatTail();
         return;
     }
 #else
