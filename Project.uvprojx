@@ -691,16 +691,6 @@
               <FilePath>.\Hardware\AD.h</FilePath>
             </File>
             <File>
-              <FileName>TF_Comm.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\Hardware\TF_Comm.c</FilePath>
-            </File>
-            <File>
-              <FileName>TF_Comm.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>.\Hardware\TF_Comm.h</FilePath>
-            </File>
-            <File>
               <FileName>Wavelet.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\Hardware\Wavelet.c</FilePath>
@@ -709,16 +699,6 @@
               <FileName>Wavelet.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\Hardware\Wavelet.h</FilePath>
-            </File>
-            <File>
-              <FileName>Modbus_Slave.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\Hardware\Modbus_Slave.c</FilePath>
-            </File>
-            <File>
-              <FileName>Modbus_Slave.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>.\Hardware\Modbus_Slave.h</FilePath>
             </File>
             <File>
               <FileName>RegisterMap.c</FileName>

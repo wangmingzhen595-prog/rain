@@ -26,6 +26,8 @@ static void RainAreaBuffer_ClearEvent(RainAreaEvent_t *evt)
     evt->gain_x100 = 0;
     evt->raw_integral_adc_us = 0;
     evt->scaled_integral_adc_us = 0;
+    evt->impulse_mv_us = 0;
+    evt->volume_0p01mm3 = 0;
 }
 
 static uint32_t RainAreaBuffer_EnterCritical(void)

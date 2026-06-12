@@ -1,233 +1,102 @@
 #include "raindrop.h"
-#include <stdint.h>
 
-/* 电压校准系数（与main.c保持一致） */
-#ifndef ADC_VOLTAGE_CALIBRATION_FACTOR
-#define ADC_VOLTAGE_CALIBRATION_FACTOR  1.0f     // 电压不再全局缩小，按3.3V参考值换算
-#endif
+/* ===================== 标定LUT（积分值mV·us → 体积0.01mm³） =====================
+ * 2026-06 三针头标定（0.50 / 1.20 / 2.00 mm）：
+ *   integral_value, volume_mm3
+ *   572954,  10.416
+ *   1367650, 30.075
+ *   2226520, 38.461
+ * 注意：三段斜率并不完全线性，1.20→2.00mm 区间斜率明显下降，可能与大滴
+ * 二次脉冲、溅射、振铃尾巴或主脉冲窗口包含更多能量有关；当前按分段线性
+ * 查表执行，后续补测约1.6mm针头验证第三段后再修表。 */
 
-/* ===================== LUT数据表（电压mV，体积0.01mm³） ===================== */
-/* 基于实验数据：U(V): 0.36, 1.00, 1.10, 1.16, 1.24, 1.36, 1.40, 1.54, 1.56, 1.60, 1.80, 2.54, 2.84, 3.00 */
-/* V(mm³): 4.17, 8.474, 9.259, 10.416, 11.494, 15.625, 17.857, 19.047, 20.979, 25.000, 30.075, 31.847, 35.714, 38.461 */
-/* 转换为整数：电压以mV，体积以0.01mm³为单位 */
+#define RAIN_LUT_SIZE  3
 
-#define LUT_SIZE  14
-
-/* 电压LUT（mV），严格单调递增 */
-static const uint16_t U_tab_mv[LUT_SIZE] = {
-    360,  1000, 1100, 1160, 1240, 1360, 1400, 
-    1540, 1560, 1600, 1800, 2540, 2840, 3000
+/* 积分值LUT（mV·us），严格单调递增 */
+static const uint32_t integral_tab[RAIN_LUT_SIZE] = {
+    572954,
+    1367650,
+    2226520
 };
 
-/* 体积LUT（0.01mm³），严格单调递增 */
-static const uint32_t V_tab_0p01mm3[LUT_SIZE] = {
-    417,  847,  926,  1042, 1149, 1563, 1786,
-    1905, 2098, 2500, 3008, 3185, 3571, 3846
+/* 体积LUT（0.01mm³），与integral_tab逐点对应 */
+static const uint32_t volume_tab_0p01mm3[RAIN_LUT_SIZE] = {
+    1042,
+    3008,
+    3846
 };
 
-/* ===================== 全局变量 ===================== */
-/* 累计体积（单位：0.01mm³），单调递增 */
-static uint32_t g_V_sum_0p01mm3 = 0;
-
-/* 死区时间控制 */
-static uint32_t g_refractory_counter = 0;  /* 死区计数器（主循环次数，每10ms递减） */
-#define REFRACTORY_COUNTER_MAX  (RAIN_REFRACTORY_MS / 10)  /* 死区时间对应的主循环次数 */
-
-/* ===================== 内部函数 ===================== */
-
-/**
- * @brief  二分查找：在U_tab_mv中找到U_meas_mV所在的区间
- * @param  U_meas_mV: 测量电压值（mV）
- * @retval 区间索引k，满足 U_tab_mv[k] <= U_meas_mV <= U_tab_mv[k+1]
- *         如果U_meas_mV < U_tab_mv[0]，返回0
- *         如果U_meas_mV >= U_tab_mv[last]，返回LUT_SIZE-2（最后一个有效区间）
- */
-static uint8_t BinarySearch_Voltage(uint32_t U_meas_mV)
-{
-    uint8_t left = 0;
-    uint8_t right = LUT_SIZE - 1;
-    uint8_t mid;
-    
-    /* 边界处理：小于最小值 */
-    if (U_meas_mV < U_tab_mv[0])
-    {
-        return 0;
-    }
-    
-    /* 边界处理：大于等于最大值 */
-    if (U_meas_mV >= U_tab_mv[LUT_SIZE - 1])
-    {
-        return LUT_SIZE - 2;  /* 返回最后一个有效区间 */
-    }
-    
-    /* 二分查找 */
-    while (left < right - 1)
-    {
-        mid = (left + right) / 2;
-        if (U_tab_mv[mid] <= U_meas_mV)
-        {
-            left = mid;
-        }
-        else
-        {
-            right = mid;
-        }
-    }
-    
-    return left;
-}
-
-/**
- * @brief  ADC值转换为电压（mV）
- * @param  adc_value: ADC原始值（0-4095）
- * @retval 电压值（mV）
- * @note   使用统一公式：U_mV = adc * Vref_mV / 4095 * ADC_VOLTAGE_CALIBRATION_FACTOR
- *         与main.c中的Compute_Voltage_From_ADC保持一致
- */
-static uint32_t ADC_To_Voltage_mV(uint16_t adc_value)
-{
-    /* 先乘后除，避免精度损失，并应用校准系数 */
-    /* 注意：使用float中间计算，然后转换为整数，确保与main.c一致 */
-    /* 公式：U_mV = (adc / 4095 * 3.3V) * 校准系数 * 1000 */
-    /* 与main.c中的Compute_Voltage_From_ADC完全一致 */
-    float voltage_V = ((float)adc_value / (float)RAIN_ADC_MAX_VALUE) * ((float)RAIN_ADC_REF_VOLTAGE_MV / 1000.0f) * ADC_VOLTAGE_CALIBRATION_FACTOR;
-    uint32_t voltage_mV = (uint32_t)(voltage_V * 1000.0f + 0.5f);  /* 四舍五入到mV */
-    return voltage_mV;
-}
+/* ===================== 模块状态 ===================== */
+static uint32_t g_last_volume_0p01mm3 = 0;   /* 最近一滴体积 */
+static uint32_t g_total_volume_0p01mm3 = 0;  /* 累计体积，单调递增 */
 
 /* ===================== 公共函数实现 ===================== */
 
 void Raindrop_Init(void)
 {
-    g_V_sum_0p01mm3 = 0;
-    g_refractory_counter = 0;
+    g_last_volume_0p01mm3 = 0;
+    g_total_volume_0p01mm3 = 0;
 }
 
-uint32_t Raindrop_VoltageToVolume_0p01mm3(uint32_t U_meas_mV, uint8_t *status_flag)
+uint32_t Raindrop_IntegralToVolume_0p01mm3(uint32_t integral)
 {
-    /* 严格边界处理：U < 300mV -> NOISE */
-    if (U_meas_mV < 300)
+    uint8_t k;
+
+    if (integral == 0U)
     {
-        *status_flag = RAIN_STATUS_NOISE;
         return 0;
     }
-    
-    /* 灰区处理：300 <= U < 360mV */
-    if (U_meas_mV < U_tab_mv[0])  /* U_tab_mv[0] = 360 */
+
+    /* 低于第一个标定点：按 (0,0)→(integral_tab[0],volume_tab[0]) 线性换算 */
+    if (integral < integral_tab[0])
     {
-        *status_flag = RAIN_STATUS_GRAY;
-        
-        #if (RAIN_GRAY_AS_MIN_DROP == 1)
-            /* 灰区视为最小雨滴 */
-            return V_tab_0p01mm3[0];
-        #else
-            /* 灰区默认不计量 */
-            return 0;
-        #endif
+        uint64_t num = (uint64_t)integral * volume_tab_0p01mm3[0];
+        uint32_t den = integral_tab[0];
+        return (uint32_t)((num + den / 2U) / den);
     }
-    
-    /* 上限处理：U >= U_tab_mv[last] -> 上夹紧 */
-    if (U_meas_mV >= U_tab_mv[LUT_SIZE - 1])
+
+    /* 高于最大标定点：暂时上夹紧（待补测大滴段后扩表） */
+    if (integral >= integral_tab[RAIN_LUT_SIZE - 1])
     {
-        *status_flag = RAIN_STATUS_OK;
-        return V_tab_0p01mm3[LUT_SIZE - 1];
+        return volume_tab_0p01mm3[RAIN_LUT_SIZE - 1];
     }
-    
-    /* 正常区间：U_tab_mv[0] <= U < U_tab_mv[last] -> 二分查找+插值 */
-    *status_flag = RAIN_STATUS_OK;
-    
-    /* 二分查找找到区间 */
-    uint8_t k = BinarySearch_Voltage(U_meas_mV);
-    
-    /* 获取区间端点 */
-    uint32_t U0 = U_tab_mv[k];
-    uint32_t U1 = U_tab_mv[k + 1];
-    uint32_t V0 = V_tab_0p01mm3[k];
-    uint32_t V1 = V_tab_0p01mm3[k + 1];
-    
-    /* 线性插值：V = V0 + (V1-V0) * (U-U0) / (U1-U0) */
-    /* 使用int64_t防止乘法溢出 */
-    int64_t num = (int64_t)(V1 - V0) * (int64_t)(U_meas_mV - U0);
-    int32_t den = (int32_t)(U1 - U0);
-    
-    /* 计算插值结果 */
-    int32_t V = (int32_t)V0 + (int32_t)(num / den);
-    
-    /* 确保结果非负 */
-    if (V < 0)
+
+    /* 标定点范围内：分段线性插值，乘法用uint64_t防溢出，除法四舍五入 */
+    for (k = 0; k < RAIN_LUT_SIZE - 1; k++)
     {
-        V = 0;
+        if (integral < integral_tab[k + 1])
+        {
+            uint32_t dx = integral_tab[k + 1] - integral_tab[k];
+            uint32_t dy = volume_tab_0p01mm3[k + 1] - volume_tab_0p01mm3[k];
+            uint32_t offset = integral - integral_tab[k];
+            uint64_t num = (uint64_t)offset * dy;
+            return volume_tab_0p01mm3[k] + (uint32_t)((num + dx / 2U) / dx);
+        }
     }
-    
-    return (uint32_t)V;
+
+    /* 不可达（上方已覆盖全部区间），防御性兜底 */
+    return volume_tab_0p01mm3[RAIN_LUT_SIZE - 1];
 }
 
-void Raindrop_ProcessOneDrop(uint16_t adc_peak)
+void Raindrop_CommitByIntegral(uint32_t integral)
 {
-    /* 死区时间检查：如果还在死区内，不处理新事件 */
-    if (g_refractory_counter > 0)
-    {
-        return;
-    }
-    
-    /* ADC转电压（mV） */
-    uint32_t U_meas_mV = ADC_To_Voltage_mV(adc_peak);
-    
-    /* 电压转体积 */
-    uint8_t status_flag;
-    uint32_t V_drop_0p01mm3 = Raindrop_VoltageToVolume_0p01mm3(U_meas_mV, &status_flag);
-    
-    /* 累计条件判断 */
-    uint8_t should_accumulate = 0;
-    
-    if (status_flag == RAIN_STATUS_OK)
-    {
-        should_accumulate = 1;
-    }
-    else if (status_flag == RAIN_STATUS_GRAY && RAIN_GRAY_AS_MIN_DROP == 1)
-    {
-        should_accumulate = 1;
-    }
-    
-    /* 累计体积 */
-    if (should_accumulate && V_drop_0p01mm3 > 0)
-    {
-        g_V_sum_0p01mm3 += V_drop_0p01mm3;
-        
-        /* 启动死区时间 */
-        g_refractory_counter = REFRACTORY_COUNTER_MAX;
-    }
-    
-    /* 调试输出（可选，用于排查问题） */
-    /* 可以通过串口输出：ADC值、电压值、状态、体积值、累计值 */
+    uint32_t volume = Raindrop_IntegralToVolume_0p01mm3(integral);
+
+    g_last_volume_0p01mm3 = volume;
+    g_total_volume_0p01mm3 += volume;
+}
+
+uint32_t Raindrop_GetLastVolume_0p01mm3(void)
+{
+    return g_last_volume_0p01mm3;
 }
 
 uint32_t Raindrop_GetTotalVolume_0p01mm3(void)
 {
-    return g_V_sum_0p01mm3;
+    return g_total_volume_0p01mm3;
 }
 
 void Raindrop_ResetTotalVolume(void)
 {
-    g_V_sum_0p01mm3 = 0;
-}
-
-void Raindrop_AddVolume(uint32_t volume_0p01mm3)
-{
-    if (volume_0p01mm3 > 0)
-    {
-        g_V_sum_0p01mm3 += volume_0p01mm3;
-    }
-}
-
-/**
- * @brief  死区时间递减（应在主循环中每10ms调用一次）
- * @note   此函数需要外部调用，建议在main.c的主循环中调用
- */
-void Raindrop_UpdateRefractory(void)
-{
-    if (g_refractory_counter > 0)
-    {
-        g_refractory_counter--;
-    }
+    g_total_volume_0p01mm3 = 0;
 }

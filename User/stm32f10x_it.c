@@ -24,7 +24,6 @@
 /* Includes ------------------------------------------------------------------*/
 #include "stm32f10x_it.h"
 #include "AD.h"                          // 添加AD头文件
-#include "Modbus_Slave.h"               // Modbus从站头文件（USART2）
 #include "SPI_SlaveLink.h"              // SPI 从机链路层（SPI1 + EXTI4）
 
 /* 峰值检测相关常量定义（与main.c保持一致） */
@@ -70,7 +69,7 @@
 /* Private macro -------------------------------------------------------------*/
 /* Private variables ---------------------------------------------------------*/
 /* Private function prototypes -----------------------------------------------*/
-static void Start_Snapshot_From_Index(uint16_t trig_idx_ch0, uint16_t trig_val_ch0);
+static void Start_Snapshot_From_Index(uint16_t trig_idx_ch0);
 static void Evaluate_Diff_Trigger(uint16_t ch0_value, uint16_t idx_ch0);
 
 /* Private variables ---------------------------------------------------------*/
@@ -230,7 +229,6 @@ static void UpdateBaseline(PeakDetectorContext *ctx, uint16_t value)
     }
 }
 
-static void Start_Watchdog_Snapshot(void);
 static void Update_Live_Diagnostics(uint16_t ch0_value, uint16_t ch1_value)
 {
     extern volatile uint16_t dbg_live_pa0_max;
@@ -497,7 +495,7 @@ static void Process_ADC_Sample(uint8_t channel, uint16_t value, uint16_t ring_in
 
 }
 
-static void Start_Snapshot_From_Index(uint16_t trig_idx_ch0, uint16_t trig_val_ch0)
+static void Start_Snapshot_From_Index(uint16_t trig_idx_ch0)
 {
     extern volatile uint16_t adc_ring_buffer_ch0[RING_BUFFER_SIZE];
     extern volatile uint16_t adc_ring_buffer_ch1[RING_BUFFER_SIZE];
@@ -522,15 +520,14 @@ static void Start_Snapshot_From_Index(uint16_t trig_idx_ch0, uint16_t trig_val_c
         snapshot_buffer_low[k] = adc_ring_buffer_ch1[idx];
     }
 
-    /* 将触发样本放在索引 SNAPSHOT_PRE_SAMPLES */
-    snapshot_buffer_high[SNAPSHOT_PRE_SAMPLES] = trig_val_ch0;
-    snapshot_buffer_low[SNAPSHOT_PRE_SAMPLES] = adc_ring_buffer_ch1[trig_idx_ch0];
-
     /* 保存触发时的环形缓冲区索引，用于后续计算PA1对应位置 */
     extern volatile uint16_t snapshot_trigger_index_ch0;
     snapshot_trigger_index_ch0 = trig_idx_ch0;
 
-    snapshot_write_index = SNAPSHOT_PRE_SAMPLES + 1;
+    /* 触发样本不在这里写入：本函数返回后，DMA循环同一次迭代的快照填充段
+       会把当前样本对（PA0/PA1）写到索引 SNAPSHOT_PRE_SAMPLES。
+       之前这里预写一份、填充段再写一份，导致触发样本重复、后段整体右移14us */
+    snapshot_write_index = SNAPSHOT_PRE_SAMPLES;
     snapshot_collecting = 1;
 }
 
@@ -584,7 +581,7 @@ static void Evaluate_Diff_Trigger(uint16_t ch0_value, uint16_t idx_ch0)
 
     if (trigger_now)
     {
-        Start_Snapshot_From_Index(idx_ch0, ch0_value);
+        Start_Snapshot_From_Index(idx_ch0);
     }
 }
 

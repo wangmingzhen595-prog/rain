@@ -3,71 +3,49 @@
 
 #include <stdint.h>
 
-/* ===================== 编译期配置 ===================== */
-/* 灰区策略开关：默认灰区不计量；若设为 1，则 300–360mV 视为最小雨滴体积并计入 */
-#define RAIN_GRAY_AS_MIN_DROP  0
-
-/* ADC参考电压（mV），默认3300mV */
-#define RAIN_ADC_REF_VOLTAGE_MV  3300
-
-/* ADC分辨率：12位，最大值4095 */
-#define RAIN_ADC_MAX_VALUE  4095
-
-/* 死区时间（毫秒），建议30-80ms，可配置 */
-#define RAIN_REFRACTORY_MS  50
-
-/* ===================== 状态标志定义 ===================== */
-#define RAIN_STATUS_NOISE  0  /* 无效/噪声 */
-#define RAIN_STATUS_GRAY   1  /* 灰区可疑 */
-#define RAIN_STATUS_OK     2  /* 计量有效 */
-
-/* ===================== 函数接口 ===================== */
+/* =====================================================================
+ * 雨滴体积换算模块（积分值标定方案）
+ *
+ * 输入：主脉冲电压时间积分值 integral（mV·us，由主流程算好传入，
+ *       本模块不做任何 ADC/采样/积分计算）。
+ * 输出：体积统一使用 0.01mm³ 的 uint32_t 整数单位，全程无 float。
+ *
+ * 模块只负责：积分值查表转体积、保存最近一滴体积、累加累计体积。
+ * ===================================================================== */
 
 /**
- * @brief  初始化雨滴体积换算模块
- * @note   初始化LUT、累计量等，应在系统启动时调用一次
+ * @brief  初始化（清零最近一滴体积与累计体积）
  */
 void Raindrop_Init(void);
 
 /**
- * @brief  处理一次雨滴事件（从ADC峰值到体积累计的完整流程）
- * @param  adc_peak: 单次事件的峰值ADC值（12位，0-4095）
- * @note   内部完成：ADC→mV、门限判定、查表+插值、累计
- *         包含死区时间控制，避免同一滴雨被多次计量
+ * @brief  积分值转体积（分段线性查表+插值，定点整数）
+ * @param  integral: 主脉冲积分值（mV·us）
+ * @retval 体积（单位：0.01mm³）
  */
-void Raindrop_ProcessOneDrop(uint16_t adc_peak);
+uint32_t Raindrop_IntegralToVolume_0p01mm3(uint32_t integral);
 
 /**
- * @brief  电压转体积（定点整数实现）
- * @param  U_meas_mV: 测量电压值（单位：mV）
- * @param  status_flag: 输出参数，状态标志（0=NOISE, 1=GRAY, 2=OK）
- * @retval 体积值（单位：0.01mm³）
- * @note   使用查表+二分查找+线性插值，全程定点整数计算
+ * @brief  提交一滴有效雨滴：换算体积、保存最近值并累加累计值
+ * @param  integral: 本滴主脉冲积分值（mV·us）
+ * @note   每个有效雨滴只能调用一次（调用点在事件确认链路，不在显示刷新）
  */
-uint32_t Raindrop_VoltageToVolume_0p01mm3(uint32_t U_meas_mV, uint8_t *status_flag);
+void Raindrop_CommitByIntegral(uint32_t integral);
 
 /**
- * @brief  获取累计体积总量
- * @retval 累计体积（单位：0.01mm³）
- * @note   主控可通过此函数读取累计值，然后做差分计算雨量增量
+ * @brief  读取最近一滴体积（单位：0.01mm³）
+ */
+uint32_t Raindrop_GetLastVolume_0p01mm3(void);
+
+/**
+ * @brief  读取累计体积（单位：0.01mm³）
+ * @note   uint32_t 上限约 42,949,672.95mm³（约43L），当前阶段够用
  */
 uint32_t Raindrop_GetTotalVolume_0p01mm3(void);
 
 /**
- * @brief  重置累计体积（用于清零或标定）
+ * @brief  累计体积清零（定期清零或人工清零用）
  */
 void Raindrop_ResetTotalVolume(void);
-
-/**
- * @brief  直接累加体积（简化接口）
- * @param  volume_0p01mm3: 要累加的体积值（单位：0.01mm³）
- */
-void Raindrop_AddVolume(uint32_t volume_0p01mm3);
-
-/**
- * @brief  死区时间递减更新（应在主循环中每10ms调用一次）
- * @note   用于递减死区计数器，允许下一次雨滴事件进入计量流程
- */
-void Raindrop_UpdateRefractory(void);
 
 #endif /* __RAINDROP_H */

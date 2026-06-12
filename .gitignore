@@ -1,0 +1,12 @@
+# Keil build artifacts
+Objects/
+Listings/
+DebugConfig/
+*.uvguix.*
+
+# Python
+.venv/
+__pycache__/
+
+# IDE
+.idea/

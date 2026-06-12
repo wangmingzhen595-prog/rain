@@ -8,8 +8,8 @@ extern "C" {
 #endif
 
 #define RAIN_AREA_QUEUE_SIZE        16U
-#define RAIN_AREA_FIRMWARE_VERSION  0x0100U
-#define RAIN_AREA_PROTOCOL_VERSION  0x0002U
+#define RAIN_AREA_FIRMWARE_VERSION  0x0101U
+#define RAIN_AREA_PROTOCOL_VERSION  0x0003U  /* v3：事件新增impulse_mv_us/volume_0p01mm3，新增累计寄存器 */
 
 #define RAIN_AREA_SOURCE_PA0        0U
 #define RAIN_AREA_SOURCE_PA1        1U
@@ -18,6 +18,8 @@ extern "C" {
 #define RAIN_AREA_FLAG_USE_PA1      0x0002U
 #define RAIN_AREA_FLAG_SCALED_VALID 0x0004U
 #define RAIN_AREA_FLAG_RAW_VALID    0x0008U
+#define RAIN_AREA_FLAG_PULSE_FAIL   0x0010U  /* 主脉冲提取失败，面积/积分为前部窗口保守现算值 */
+#define RAIN_AREA_FLAG_RELAXED      0x0020U  /* 严格形状验证未通过，由核心物理闸门（幅度/脉宽/持续时间）计入 */
 
 typedef struct
 {
@@ -33,6 +35,8 @@ typedef struct
     uint16_t gain_x100;
     uint32_t raw_integral_adc_us;
     uint32_t scaled_integral_adc_us;
+    uint32_t impulse_mv_us;       /* 统一口径积分（mV·us），体积换算的输入 */
+    uint32_t volume_0p01mm3;      /* 本滴体积（0.01mm³） */
 } RainAreaEvent_t;
 
 void RainAreaBuffer_Init(void);

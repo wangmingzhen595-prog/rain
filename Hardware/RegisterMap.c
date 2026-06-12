@@ -3,6 +3,12 @@
 #include "AD.h"
 #include "RainAreaBuffer.h"
 
+/* 计量累计数据（定义在main.c/raindrop.c，经Input 0x0040~0x0045对主机暴露） */
+extern volatile uint32_t effective_drop_count;   /* 有效滴数 */
+extern volatile uint32_t raw_event_count;        /* 原始事件数（每张被处理的触发快照） */
+extern uint32_t Raindrop_GetTotalVolume_0p01mm3(void);
+extern void Raindrop_ResetTotalVolume(void);
+
 static volatile uint8_t  s_slave_addr = 1;   /* Holding 0x0000 */
 static volatile uint16_t s_threshold_cfg = 0;/* Kept for legacy local access only. */
 
@@ -36,6 +42,19 @@ static uint16_t Read_Event_Field(const RainAreaEvent_t *evt, uint16_t base, uint
         case 0x000D: return Read_U32_Low(evt->raw_integral_adc_us);
         case 0x000E: return Read_U32_High(evt->scaled_integral_adc_us);
         case 0x000F: return Read_U32_Low(evt->scaled_integral_adc_us);
+        default:     return 0;
+    }
+}
+
+/* 事件扩展字段（协议v3新增，独立地址段避免与原0x10/0x20窗口冲突） */
+static uint16_t Read_Event_Ext_Field(const RainAreaEvent_t *evt, uint16_t base, uint16_t addr)
+{
+    switch ((uint16_t)(addr - base))
+    {
+        case 0x0000: return Read_U32_High(evt->impulse_mv_us);
+        case 0x0001: return Read_U32_Low(evt->impulse_mv_us);
+        case 0x0002: return Read_U32_High(evt->volume_0p01mm3);
+        case 0x0003: return Read_U32_Low(evt->volume_0p01mm3);
         default:     return 0;
     }
 }
@@ -89,6 +108,7 @@ uint16_t RegisterMap_ReadHolding(uint16_t addr, uint8_t *exception)
         case 0x0001:
         case 0x0002:
         case 0x0003:
+        case 0x0004:
             return 0;
 
         default:
@@ -144,6 +164,27 @@ uint8_t RegisterMap_WriteHolding(uint16_t addr, uint16_t value, uint8_t *excepti
             if (value == 0xA55AU)
             {
                 RainAreaBuffer_ClearStats();
+                return 1;
+            }
+            if (value == 0U)
+            {
+                return 1;
+            }
+            if (exception)
+            {
+                *exception = 0x03;
+            }
+            return 0;
+
+        case 0x0004:
+            /* 清计量统计（协议v3）：累计体积/有效滴数/原始事件数。
+             * 在SPI中断上下文执行，主循环同刻的一次递增可能丢失，
+             * 对人工/定期清零场景可接受 */
+            if (value == 0xA55AU)
+            {
+                Raindrop_ResetTotalVolume();
+                effective_drop_count = 0;
+                raw_event_count = 0;
                 return 1;
             }
             if (value == 0U)
@@ -239,6 +280,36 @@ uint16_t RegisterMap_ReadInput(uint16_t addr, uint8_t *exception)
         case 0x002F:
             (void)RainAreaBuffer_PeekOldest(&evt);
             return Read_Event_Field(&evt, 0x0020U, addr);
+
+        /* 最新事件扩展字段（协议v3）：积分mV·us与单滴体积0.01mm³ */
+        case 0x0030:
+        case 0x0031:
+        case 0x0032:
+        case 0x0033:
+            (void)RainAreaBuffer_GetLatest(&evt);
+            return Read_Event_Ext_Field(&evt, 0x0030U, addr);
+
+        /* 最旧未读事件扩展字段（协议v3） */
+        case 0x0034:
+        case 0x0035:
+        case 0x0036:
+        case 0x0037:
+            (void)RainAreaBuffer_PeekOldest(&evt);
+            return Read_Event_Ext_Field(&evt, 0x0034U, addr);
+
+        /* 计量累计（协议v3）：主机按差分换算雨量 */
+        case 0x0040:
+            return Read_U32_High(Raindrop_GetTotalVolume_0p01mm3());
+        case 0x0041:
+            return Read_U32_Low(Raindrop_GetTotalVolume_0p01mm3());
+        case 0x0042:
+            return Read_U32_High(effective_drop_count);
+        case 0x0043:
+            return Read_U32_Low(effective_drop_count);
+        case 0x0044:
+            return Read_U32_High(raw_event_count);
+        case 0x0045:
+            return Read_U32_Low(raw_event_count);
 
         default:
             if (exception)

@@ -8,8 +8,8 @@
 // 数组大小为200，表示100个PA0样本+100个PA1样本
 uint16_t AD_Value[200];
 
-/* 扩展：环形缓冲与快照（原双通道模式，当前仅使用通道0） */
-/* 双通道环形缓冲区：目前仅通道0实际参与处理，通道1保留以便后续扩展 */
+/* 扩展：双通道同索引环形缓冲与快照 */
+/* ch0[i]与ch1[i]是同一时刻的一对样本：PA0用于触发/计量，PA1用于削顶诊断与接管 */
 volatile uint16_t adc_ring_buffer_ch0[RING_BUFFER_SIZE];  // 通道0环形缓冲区
 volatile uint16_t adc_ring_buffer_ch1[RING_BUFFER_SIZE];  // 通道1环形缓冲区
 volatile uint16_t ring_write_index_ch0 = 0;  // 通道0写索引
@@ -90,15 +90,17 @@ void AD_Init(void)
     RCC_ADCCLKConfig(RCC_PCLK2_Div6);
     
     // 配置PA0和PA1引脚为模拟输入模式
-    // 当前只使用PA0接雨滴传感器，PA1保持为模拟输入以免悬空
+    // PA0=高增益主通道（触发/计量），PA1=低增益备用通道（削顶诊断/接管）
     GPIO_InitStructure.GPIO_Pin = GPIO_Pin_0 | GPIO_Pin_1;
     GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AIN;           // 模拟输入模式
     GPIO_Init(GPIOA, &GPIO_InitStructure);                  // 初始化GPIOA
-    
+
     // 配置ADC规则组通道：双通道扫描模式（PA0和PA1）
-    // 通道0（PA0）：采样顺序1、采样时间239.5个周期（最大采样时间，适用于高阻抗信号源）
+    // 采样时间统一用RAIN_ADC_SAMPLE_TIME（71.5周期，单次转换约7us，
+    // 双通道轮流后每通道实际采样间隔14us，见AD.h说明）
+    // 通道0（PA0）：采样顺序1
     ADC_RegularChannelConfig(ADC1, ADC_Channel_0, 1, RAIN_ADC_SAMPLE_TIME);
-    // 通道1（PA1）：采样顺序2、采样时间239.5个周期（用于PA0饱和时切换）
+    // 通道1（PA1）：采样顺序2（用于PA0削顶时诊断/接管）
     ADC_RegularChannelConfig(ADC1, ADC_Channel_1, 2, RAIN_ADC_SAMPLE_TIME);
     
     // ADC初始化配置（双通道扫描模式）
