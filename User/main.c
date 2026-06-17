@@ -11,6 +11,13 @@
 #include "RainAreaBuffer.h"
 #include "Wavelet.h"                     // 小波变换模块头文件
 #include "raindrop.h"                    // 雨滴体积换算模块头文件
+#include "RainDisplay.h"                 // ILI9341 2.4寸TFT显示模块
+
+/* LCD总开关：=1 启用TFT显示（与OLED并存，不影响雨滴计量逻辑）。 */
+#define LCD_ENABLE                       1
+/* LCD自检开关：=1 上电后画一次静态界面+假波形+假数值（仅调试接线用）；
+ * 接真实数据时保持0。 */
+#define LCD_SELFTEST                     0
 
 /* ===================== SPI 从站地址配置（类Modbus帧协议） ===================== */
 /* 修改此宏即可为本单片机设置从站地址（1~247），与主控配置一致 */
@@ -32,18 +39,31 @@
  * （两通道同步采样，削顶前的样本对天然就是标定数据），估计失败时退回
  * 保守默认值；等效结果统一钳位在 [EVENT_EQ_MIN_MV, EVENT_EQ_MAX_MV]，
  * 保证切换后读数高于3.3V削顶值、又不会因比值误差而离谱。 */
-#define PA1_VALID_MIN_MV          150UL    // PA1原始峰值下限（mV），低于此值视为通道异常（断线/无信号）
+#define PA1_VALID_MIN_MV          40UL     // PA1原始峰值下限（mV）：PA1是源头小信号(PA0=PA1×放大倍数)，削顶时实测约55mV，故下限降到40mV
 #define PA1_VALID_MAX_MV          450UL    // PA1原始峰值上限（mV），高于此值置PA1_HIGH标志（仍切换，靠上限钳位兜底）
-#define PA1_EQ_RATIO_DEFAULT_X100 300U     // 在线估计失败时的默认等效比（3.00倍，保守值）
+#define PA1_EQ_RATIO_DEFAULT_X100 300U     // 在线估计失败时的默认等效比（暂保守值，拿到实测放大倍数后再调）
 #define PA1_EQ_RATIO_MIN_X100     150U     // 等效比下限（1.5倍）
-#define PA1_EQ_RATIO_MAX_X100     1500U    // 等效比上限（15倍），防止PA1噪声把比值推爆
-#define PA1_RATIO_PA0_MIN_DELTA   800U     // 参与比值估计的PA0样本最小幅度（ADC码，约0.64V，避开小信号噪声区）
-#define PA1_RATIO_PA1_MIN_DELTA   16U      // 参与比值估计的PA1样本最小幅度（ADC码，约13mV）
+#define PA1_EQ_RATIO_MAX_X100     10000U   // 等效比上限（100倍）：PA0=PA1放大几十倍，上限放宽以免把真实大倍数钳死
+#define PA1_RATIO_PA0_MIN_DELTA   300U     // 参与比值估计的PA0样本最小幅度（ADC码，约240mV）
+#define PA1_RATIO_PA1_MIN_DELTA   6U       // 参与比值估计的PA1样本最小幅度（ADC码，约5mV）：大放大倍数下PA1很小，门限太高会取不到样本对
 #define EVENT_EQ_MIN_MV           3400UL   // 等效电压下限：PA0已削顶，真实峰值必高于3.3V
 #define EVENT_EQ_MAX_MV           5000UL   // 等效电压上限：实测最大雨滴约4.xV，钳到5V留余量
 #define EVENT_CLIP_MV             3300UL
 #define PA0_CLIP_ADC              4090U
 #define PA0_CLIP_COUNT_TH         3U
+
+/* PA0过量程"平顶"检测（用于切换到PA1） ============================================
+ * 真实饱和的大雨滴，PA0顶部会被压平——连续若干样本都贴在峰值附近（顶部可能停在
+ * 3.2~3.3V，未必顶到旧的4090硬削顶阈值，所以旧判据几乎不触发）。
+ * 判据：全快照最大值 >= PA0_OVERRANGE_GATE_ADC，且"贴近峰值（峰值-PA0_PLATEAU_BAND_ADC
+ * 以内）的最长连续样本数" >= PA0_PLATEAU_COUNT_TH，即认定PA0过量程，触发PA1接管。
+ * 这样顶部停在3.2V也能识别；而真正"圆顶"、未饱和的中等雨滴顶部不平，不会被误判
+ * （误判会被Build_Event_Result钳到≥3.4V而读大）。三个值都可对照示波器现场整定：
+ *   门限调低→更早切PA1（但中等雨滴误判风险↑）；带宽调小/点数调大→更严格只认真平顶。 */
+#define PA0_OVERRANGE_GATE_MV     2800U    // 过量程电压门限(mV)，约2.8V：峰值低于此不当作过量程
+#define PA0_OVERRANGE_GATE_ADC    ((uint16_t)(((uint32_t)PA0_OVERRANGE_GATE_MV * (uint32_t)ADC_FULL_SCALE) / ADC_REF_MV))  // ≈3475 ADC
+#define PA0_PLATEAU_BAND_ADC      25U      // 平顶带宽(ADC码,约20mV)：样本与峰值之差≤此值算"贴顶"（放宽以容纳饱和纹波）
+#define PA0_PLATEAU_COUNT_TH      5U       // 连续"贴顶"样本数下限(约70us@14us采样)，达到即判为平顶饱和
 
 #define EVENT_RESULT_SOURCE_PA0   0U
 #define EVENT_RESULT_SOURCE_PA1   1U
@@ -71,6 +91,18 @@
 #define MAX_THRESHOLD           3000     // 阈值上限，防止过高
 #define MAD_GAIN                3        // 平均绝对偏差放大倍数
 #define HYSTERESIS_MARGIN       15       // 阈值滞回，降低抖动
+
+/* ===================== 测试用：固定采集阈值（约2V） =====================
+ * 临时把"采集雨滴的阈值"抬高到约2V用于测试。
+ *   - RAIN_TEST_FIXED_THRESHOLD_ENABLE = 1：跳过噪声自适应，把动态阈值钉死在
+ *     RAIN_TEST_FIXED_THRESHOLD_MV 对应的ADC码上（同时作用于硬件模拟看门狗触发
+ *     与快照事件验证两处）。
+ *   - 测试完成后把 RAIN_TEST_FIXED_THRESHOLD_ENABLE 改回 0，即可完全恢复原自适应
+ *     阈值逻辑（MIN_THRESHOLD~MAX_THRESHOLD）。只需改本宏，无需改动其它代码。 */
+#define RAIN_TEST_FIXED_THRESHOLD_ENABLE   1        // =1 启用固定阈值（测试）；=0 恢复自适应阈值
+#define RAIN_TEST_FIXED_THRESHOLD_MV       2000U    // 固定阈值对应电压（mV），≈2V
+#define RAIN_TEST_FIXED_THRESHOLD_ADC \
+	((uint16_t)(((uint32_t)RAIN_TEST_FIXED_THRESHOLD_MV * (uint32_t)ADC_FULL_SCALE) / ADC_REF_MV))  // 2000mV → ≈2481 ADC码
 
 /* 事件与抗干扰判定 */
 #define MIN_PEAK_DELTA_OVER_THR 8        // 峰值需高出阈值的最小余量（约6.5mV，适配小信号）
@@ -107,6 +139,12 @@
 /* 显示门限：小于该幅度的脉冲不刷新OLED（仅在主循环中使用） */
 #define DISPLAY_MIN_AMPLITUDE   400      // 显示下限约 320mV，适配420-540mV小雨滴信号显示
 
+/* LCD波形显示门限（测试用，可调）：只有本张快照PA0实采绝对峰值≥此电压时才刷新LCD波形。
+ * 与采集阈值独立——高干扰阶段可单独调高此值来滤掉小信号波形，不影响计数与OLED。
+ * 测试完按需改回（设0即不过滤、每张快照都刷）。 */
+#define LCD_WAVE_MIN_MV         2000U    // LCD波形显示电压门限(mV)，约2V
+#define LCD_WAVE_MIN_ADC        ((uint16_t)(((uint32_t)LCD_WAVE_MIN_MV * (uint32_t)ADC_FULL_SCALE) / ADC_REF_MV))  // 2000mV ≈ 2481 ADC码
+
 /* 峰值检测状态机定义 */
 #define PEAK_STATE_IDLE         0        // 空闲状态
 #define PEAK_STATE_SEARCHING    1        // 峰值搜索状态
@@ -133,12 +171,16 @@
 #define US_TO_SAMPLES_CEIL(us) \
 	((uint16_t)((((uint32_t)(us) * 1000UL) + ADC_SAMPLE_INTERVAL_NS - 1UL) / ADC_SAMPLE_INTERVAL_NS))
 
-#define MAIN_PULSE_PRE_US          350U
-#define MAIN_PULSE_POST_US         1400U
+/* 主脉冲积分窗口：覆盖完整主脉冲（不再截断）。
+ * POST放宽到~4.5ms，让"脉冲结束"由信号自身衰减决定，而非固定上限。
+ * 结束判定改为绝对值包络：|信号-基线|连续 SETTLE_COUNT 点落在 ±BASELINE_DELTA 带内，
+ * 这样负半周不会被误判为结束，积分覆盖整个振荡串。delta/count为现场可调经验值。 */
+#define MAIN_PULSE_PRE_US          500U
+#define MAIN_PULSE_POST_US         4500U
 #define MAIN_PULSE_PRE_SAMPLES     US_TO_SAMPLES_CEIL(MAIN_PULSE_PRE_US)
 #define MAIN_PULSE_POST_SAMPLES    US_TO_SAMPLES_CEIL(MAIN_PULSE_POST_US)
-#define MAIN_PULSE_BASELINE_DELTA  8U
-#define MAIN_PULSE_SETTLE_COUNT    3U
+#define MAIN_PULSE_BASELINE_DELTA  25U     /* 包络settle带宽（ADC码，约20mV） */
+#define MAIN_PULSE_SETTLE_COUNT    8U      /* 连续落带内点数（约112us）才算结束 */
 #define MAIN_PULSE_MIN_WIDTH       8U
 
 /* 峰值大小分类阈值（用于动态调整参数） */
@@ -306,6 +348,7 @@ static RainEventResult_t Build_Event_Result(uint8_t pa0_clipped,
                                             uint32_t pa1_eq_peak_mv,
                                             uint32_t pa1_eq_impulse_mv_us);
 static uint16_t Count_Max_Consecutive_Saturation(uint16_t *buf, uint16_t len);
+static uint8_t Detect_PA0_Plateau(uint16_t *buf, uint16_t len); // PA0平顶饱和检测（过量程→切PA1）
 static void Integrate_Delta_Window_ADC_us(uint16_t *buf, uint16_t start_index,
                                           uint16_t end_index, int32_t baseline,
                                           uint32_t *area_samples,
@@ -418,7 +461,20 @@ volatile uint16_t dbg_live_pa0_max = 0;
 volatile uint16_t dbg_live_pa1_max = 0;
 volatile uint16_t dbg_live_pa0_sat_run = 0;
 volatile uint16_t dbg_live_pa0_sat_max = 0;
+/* 平顶检测诊断（每张快照更新，用于现场整定门限/带宽/点数） */
+volatile uint16_t dbg_pa0_abs_max = 0;       // PA0全快照实采绝对峰值（ADC码）
+volatile uint16_t dbg_pa0_plateau_run = 0;   // PA0贴顶最长连续样本数
 static RainEventResult_t shadow_result = {0};
+
+#if LCD_ENABLE
+/* TFT波形显示：只在"有效滴(被计数)"时画一帧(从export_buffer, 21ms全分辨率)，画完保持
+ * 在屏上直到下一滴——平时不重画，所以波形不会被随后的噪声触发覆盖、也不会一闪而过。 */
+static volatile uint8_t lcd_draw_pending = 0;
+static uint16_t lcd_wave_baseline = 0;
+static uint16_t lcd_wave_threshold = 0;
+static uint16_t lcd_wave_peak_index = 0;
+static uint8_t  lcd_wave_pa1 = 0;
+#endif
 
 /**
   * @brief  主函数
@@ -432,19 +488,51 @@ int main(void)
     Delay_Init();                        // 初始化延时函数，配置SysTick定时器
     OLED_Init();                         // 初始化OLED显示屏，配置I2C通信和显示参数
     AD_Init();                           // 初始化ADC和DMA，配置连续采样模式
+#if RAIN_TEST_FIXED_THRESHOLD_ENABLE
+    /* 测试：上电即把采集阈值固定到约2V（与Update_Adaptive_Threshold保持一致） */
+    dynamic_threshold = RAIN_TEST_FIXED_THRESHOLD_ADC;
+    AD_SetThreshold(RAIN_TEST_FIXED_THRESHOLD_ADC);
+#else
     AD_SetThreshold(THRESHOLD);          // 设置模拟看门狗阈值
+#endif
     USART1_Config();                     // 初始化USART1串口（PA9=TX，PA10=RX，115200 8N1）
     RainAreaBuffer_Init();
     /* SPI 从站链路层初始化（SPI1，PA4=NSS，PA5=SCK，PA6=MISO，PA7=MOSI） */
     SPI_SlaveLink_Init(MODBUS_SLAVE_ID);
     Raindrop_Init();                     // 初始化雨滴体积换算模块
-    
+
+#if RAIN_CALIB_UART_ENABLE
+    /* 开机横幅：上电立即从USART1输出，便于确认串口链路通、固件版本对、关键参数值。
+     * 字段：BOOT,采集阈值ADC,平顶过量程门限ADC,平顶带宽,平顶点数阈值,LCD波形门限ADC */
+    USART1_SendString("\r\n=== RAIN FW plateau+diag ===\r\n");
+    USART1_SendString("BOOT,collectThrADC=");
+    USART1_SendUint32(dynamic_threshold);
+    USART1_SendString(",overGateADC=");
+    USART1_SendUint32((uint32_t)PA0_OVERRANGE_GATE_ADC);
+    USART1_SendString(",plateauBand=");
+    USART1_SendUint32((uint32_t)PA0_PLATEAU_BAND_ADC);
+    USART1_SendString(",plateauCnt=");
+    USART1_SendUint32((uint32_t)PA0_PLATEAU_COUNT_TH);
+    USART1_SendString(",lcdMinADC=");
+    USART1_SendUint32((uint32_t)LCD_WAVE_MIN_ADC);
+    USART1_SendString("\r\n");
+#endif
+
     // ========== 显示静态内容 ==========
 	OLED_ShowString(1, 1, "Volt:000.00 G:H");
 	OLED_ShowString(2, 1, "Imp:0000000000");
 	OLED_ShowString(3, 1, "D0000 V000.00");
 	OLED_ShowString(4, 1, "T0000000.00");
     
+#if LCD_ENABLE
+    /* TFT初始化：清屏+画标题栏/波形框/网格 */
+    RainDisplay_Init();
+#if LCD_SELFTEST
+    /* 自检：画一次假波形+假数值，仅用于调试接线 */
+    RainDisplay_SelfTest();
+#endif
+#endif
+
     // ========== 独立看门狗初始化（在所有初始化完成后） ==========
     IWDG_Init();                         // 初始化独立看门狗，超时时间3秒，用于死机自启动
     IWDG_ReloadCounter();                // 立即喂一次狗，确保看门狗计数器从最大值开始
@@ -520,13 +608,33 @@ int main(void)
         /* 处理快照数据（如果就绪）：用于精确的事件验证和计数 */
         Process_Snapshot_IfReady();
 
+#if LCD_ENABLE
+		/* 有效滴时画一帧(export_buffer, 21ms全分辨率)，画完保持在屏上直到下一滴：
+		 * 平时不重画 → 不被随后的噪声触发覆盖，也不会一闪而过。 */
+		if (lcd_draw_pending)
+		{
+			lcd_draw_pending = 0;
+			RainDisplay_DrawWaveform((uint16_t *)export_buffer, SNAPSHOT_SIZE,
+			                         lcd_wave_baseline, lcd_wave_threshold,
+			                         lcd_wave_peak_index, lcd_wave_pa1);
+		}
+#endif
+
 		/* 自适应阈值（基于最近噪声） */
 		Update_Adaptive_Threshold();
         
         // 每200ms更新一次显示(20次 × 10ms = 200ms)
         if (display_counter >= 20)       // 检查显示计数器是否达到20
         {
-            Update_Display();            // 调用显示更新函数
+            Update_Display();            // OLED显示更新（保留）
+#if LCD_ENABLE
+            /* TFT数值区：与OLED同源数据，单位 V / mV·us / 滴 / mm³ / mm³ / mm/h */
+            RainDisplay_UpdateStats(current_voltage, current_impulse_mv_us,
+                                    effective_drop_count,
+                                    Raindrop_GetLastVolume_0p01mm3(),
+                                    Raindrop_GetTotalVolume_0p01mm3(),
+                                    current_intensity_mmh, last_gain_used);
+#endif
             display_counter = 0;         // 重置显示计数器
         }
         
@@ -539,6 +647,20 @@ int main(void)
 			/* 统计每秒滴数窗口并计算强度 */
 			/* 注意：秒计数推进在Push_Second_Count中处理，此处仅计算强度 */
 			current_intensity_mmh = Compute_Intensity_MMH(); // 计算当前降雨强度
+
+#if RAIN_CALIB_UART_ENABLE
+			/* 串口心跳：每秒一行，无雨时也有输出，用于确认链路存活+观察事件计数。
+			 * 字段：HB,原始事件数,有效滴数,当前阈值ADC,最近快照PA0实采峰值ADC */
+			USART1_SendString("HB,raw=");
+			USART1_SendUint32(raw_event_count);
+			USART1_SendString(",eff=");
+			USART1_SendUint32(effective_drop_count);
+			USART1_SendString(",thr=");
+			USART1_SendUint32(dynamic_threshold);
+			USART1_SendString(",pa0max=");
+			USART1_SendUint32((uint32_t)dbg_pa0_abs_max);
+			USART1_SendString("\r\n");
+#endif
         }
 
         /* 喂独立看门狗：必须在3秒内喂狗，否则系统自动复位（死机自启动） */
@@ -768,7 +890,7 @@ static uint8_t Update_Peak_Display(uint16_t peak_value)
 			current_voltage = Compute_Voltage_From_ADC(current_peak);
 			/* Volt变化时累加voltage_sum */
 			voltage_sum += current_voltage;
-			last_gain_used = 'H';
+			/* 增益标志不在ISR快路径里设：由快照路径权威决定，避免把PA1的'L'秒刷回'H' */
 			last_valid_peak = peak_value;
 			last_update_counter = main_loop_counter;
 			peak_hold_counter = dynamic_hold_time;
@@ -787,11 +909,11 @@ static uint8_t Update_Peak_Display(uint16_t peak_value)
 	current_voltage = Compute_Voltage_From_ADC(current_peak);
 	/* Volt变化时累加voltage_sum */
 	voltage_sum += current_voltage;
-	last_gain_used = 'H';
+	/* 增益标志不在ISR快路径里设：由快照路径权威决定，避免把PA1的'L'秒刷回'H' */
 	last_valid_peak = peak_value;
 	last_update_counter = main_loop_counter;
 	peak_hold_counter = dynamic_hold_time;
-	
+
 	return 1;
 }
 
@@ -838,7 +960,10 @@ static void Process_Snapshot_IfReady(void)
 
 	/* PA0削顶判定提前到窗口划分之前：削顶事件需要放开前部窗口限制 */
 	uint16_t pa0_clip_count = Count_Consecutive_AtOrAbove((uint16_t *)snapshot_buffer_high, len, PA0_CLIP_ADC);
-	uint8_t pa0_clipped = (uint8_t)(pa0_clip_count >= PA0_CLIP_COUNT_TH);
+	/* 过量程 = 满量程硬削顶(连续≥4090) 或 顶部平顶饱和(顶部可能停在<4090的3.2~3.3V)。
+	 * 任一成立即视为PA0过量程，沿用下方既有逻辑触发PA1接管。 */
+	uint8_t pa0_plateau = Detect_PA0_Plateau((uint16_t *)snapshot_buffer_high, len);
+	uint8_t pa0_clipped = (uint8_t)((pa0_clip_count >= PA0_CLIP_COUNT_TH) || pa0_plateau);
 
 	/* 严格前部处理：初始峰值搜索允许在预触发区域和前部窗口内搜索，但不搜索后部数据 */
 	/* 定义前部分析窗口：触发点后的前2ms，完全忽略后部数据 */
@@ -982,12 +1107,6 @@ static void Process_Snapshot_IfReady(void)
 	snapshot_peak_value = front_peak_value;
 	snapshot_peak_index = front_peak_index;
 
-	/* 为切换判定单独计算全窗口峰值（避免前部窗口截断导致大雨滴峰值丢失） */
-	uint16_t full_peak_index = 0;
-	uint16_t full_peak_value = 0;
-	Find_Peak_In_Buffer((uint16_t *)snapshot_buffer_high, len, baseline_high,
-	                    &full_peak_index, &full_peak_value, 0, (uint16_t)(len - 1));
-
 	uint16_t max_sat_count = Count_Max_Consecutive_Saturation((uint16_t *)snapshot_buffer_high, len);
 	uint8_t pa0_saturated = (max_sat_count >= HIGH_GAIN_SAT_COUNT_TH);
 	int32_t baseline_low = Compute_Baseline((uint16_t *)snapshot_buffer_low, len);
@@ -1073,6 +1192,29 @@ static void Process_Snapshot_IfReady(void)
 	}
 	use_pa1 = (uint8_t)(shadow_result.source == EVENT_RESULT_SOURCE_PA1);
 	dbg_event_pa1_delta = pa1_peak_delta;
+
+#if RAIN_CALIB_UART_ENABLE
+	/* 切换判定诊断：每张快照一行。
+	 * 字段：SNP,事件序号,PA0实采峰值ADC,贴顶最长连续点数,硬削顶连续点数,
+	 *       PA1原始峰值mV,结果源(0=PA0/1=PA1/2=CLIP),use_pa1,在线等效比x100 */
+	USART1_SendString("SNP,");
+	USART1_SendUint32(raw_event_count);
+	USART1_SendString(",");
+	USART1_SendUint32((uint32_t)dbg_pa0_abs_max);
+	USART1_SendString(",");
+	USART1_SendUint32((uint32_t)dbg_pa0_plateau_run);
+	USART1_SendString(",");
+	USART1_SendUint32((uint32_t)pa0_clip_count);
+	USART1_SendString(",");
+	USART1_SendUint32(ADC_Count_To_mV((uint32_t)pa1_peak_delta));
+	USART1_SendString(",");
+	USART1_SendUint32((uint32_t)shadow_result.source);
+	USART1_SendString(",");
+	USART1_SendUint32((uint32_t)use_pa1);
+	USART1_SendString(",");
+	USART1_SendUint32((uint32_t)pa1_eq_ratio_x100);
+	USART1_SendString("\r\n");
+#endif
 
 	if (pa0_saturated)
 	{
@@ -1210,6 +1352,9 @@ static void Process_Snapshot_IfReady(void)
 	if (event_countable)
 	{
 		snapshot_valid_count++;   /* 两层判定通过的总数（其中兜底层占比见dbg_event_relaxed_count） */
+
+		/* 波形刷新已移到函数末尾：每张处理过的快照都刷一帧，不再只限被计数的有效滴 */
+
 		current_peak_raw = use_pa1 ? pa1_peak_raw : final_peak_value;
 		current_peak = final_peak_value;
 		current_voltage = Compute_Voltage_From_ADC(current_peak);
@@ -1436,6 +1581,22 @@ static void Process_Snapshot_IfReady(void)
 		export_buffer[i_copy] = snapshot_buffer_high[i_copy];
 	}
 	export_ready = 1;                // 设置导出就绪标志
+
+#if LCD_ENABLE
+	/* 波形刷新：每张处理过的快照都画一帧（不再只限被计数的有效滴），
+	 * 但仅当本快照PA0实采绝对峰值≥LCD_WAVE_MIN_ADC时才刷，过滤高干扰阶段的小信号。
+	 * dbg_pa0_abs_max已由Detect_PA0_Plateau在本张快照里更新为PA0全缓冲绝对峰值。
+	 * export_buffer已是本滴PA0全分辨率波形；元数据用本次快照的基线/阈值/峰值/通道。 */
+	if (dbg_pa0_abs_max >= LCD_WAVE_MIN_ADC)
+	{
+		lcd_wave_baseline = Clamp_U16_From_I32(baseline_high);
+		lcd_wave_threshold = dynamic_threshold;
+		lcd_wave_peak_index = front_peak_index;
+		lcd_wave_pa1 = use_pa1;
+		lcd_draw_pending = 1;
+	}
+#endif
+
 	snapshot_ready = 0;              // 清除快照就绪标志
 }
 
@@ -1447,6 +1608,16 @@ static void Process_Snapshot_IfReady(void)
   */
 static void Update_Adaptive_Threshold(void)
 {
+#if RAIN_TEST_FIXED_THRESHOLD_ENABLE
+	/* 测试模式：把采集阈值固定在约2V，跳过噪声自适应。
+	 * 测试完成后把 RAIN_TEST_FIXED_THRESHOLD_ENABLE 改回 0 即恢复下面的自适应逻辑。 */
+	if (dynamic_threshold != RAIN_TEST_FIXED_THRESHOLD_ADC)
+	{
+		dynamic_threshold = RAIN_TEST_FIXED_THRESHOLD_ADC;
+		AD_SetThreshold(dynamic_threshold);
+	}
+	return;
+#else
 	extern volatile uint16_t adc_ring_buffer_ch0[RING_BUFFER_SIZE]; // 通道0环形缓冲区
 	extern volatile uint16_t ring_write_index_ch0; // 通道0写索引
 	
@@ -1523,6 +1694,7 @@ static void Update_Adaptive_Threshold(void)
 		dynamic_threshold = (uint16_t)target;
 		AD_SetThreshold(dynamic_threshold); // 设置ADC模拟看门狗阈值（通道0/PA0）
 	}
+#endif
 }
 
 /**
@@ -2205,6 +2377,66 @@ static RainEventResult_t Build_Event_Result(uint8_t pa0_clipped,
 	return result;
 }
 
+/**
+  * @brief  检测PA0是否"平顶饱和"（过量程）——用于切换到PA1
+  * @param  buf: PA0高增益快照缓冲区
+  * @param  len: 缓冲区长度
+  * @retval 1=检测到平顶饱和（峰值≥门限且顶部连续贴顶≥点数阈值），0=否
+  * @note   两遍扫描：先取全快照最大值；若最大值<PA0_OVERRANGE_GATE_ADC直接判否；
+  *         否则统计落在[峰值-PA0_PLATEAU_BAND_ADC, 峰值]带内的最长连续样本数，
+  *         达到PA0_PLATEAU_COUNT_TH 即判为平顶饱和。门限/带宽/点数见宏定义，可现场整定。
+  */
+static uint8_t Detect_PA0_Plateau(uint16_t *buf, uint16_t len)
+{
+	uint16_t i;
+	uint16_t peak = 0;
+	uint16_t run = 0;
+	uint16_t max_run = 0;
+	int32_t band_low;
+
+	dbg_pa0_abs_max = 0;
+	dbg_pa0_plateau_run = 0;
+
+	if (buf == 0)
+	{
+		return 0;
+	}
+
+	for (i = 0; i < len; i++)
+	{
+		if (buf[i] > peak)
+		{
+			peak = buf[i];
+		}
+	}
+	dbg_pa0_abs_max = peak;       // 诊断：记录实采绝对峰值
+	/* 峰值没到过量程门限：肯定不是饱和，直接返回（也避免把低幅平段误判成平顶） */
+	if (peak < PA0_OVERRANGE_GATE_ADC)
+	{
+		return 0;
+	}
+
+	band_low = (int32_t)peak - (int32_t)PA0_PLATEAU_BAND_ADC;
+	for (i = 0; i < len; i++)
+	{
+		if ((int32_t)buf[i] >= band_low)
+		{
+			run++;
+			if (run > max_run)
+			{
+				max_run = run;
+			}
+		}
+		else
+		{
+			run = 0;
+		}
+	}
+	dbg_pa0_plateau_run = max_run;   // 诊断：记录贴顶最长连续点数
+
+	return (uint8_t)(max_run >= PA0_PLATEAU_COUNT_TH);
+}
+
 static uint16_t Count_Max_Consecutive_Saturation(uint16_t *buf, uint16_t len)
 {
 	uint16_t max_count = 0;
@@ -2502,7 +2734,8 @@ static uint8_t Extract_MainPulse_Features(uint16_t *buf, uint16_t len,
 {
 	uint16_t i;
 	uint8_t settle;
-	uint16_t threshold_near_base;
+	uint16_t band_lo;
+	uint16_t band_hi;
 	uint16_t threshold20;
 	uint16_t threshold50;
 
@@ -2511,7 +2744,9 @@ static uint8_t Extract_MainPulse_Features(uint16_t *buf, uint16_t len,
 		return 0;
 	}
 
-	threshold_near_base = Clamp_U16_From_I32(baseline + MAIN_PULSE_BASELINE_DELTA);
+	/* 绝对值包络带：|信号-基线|<=delta 即在带内（正负半周对称判定） */
+	band_lo = Clamp_U16_From_I32(baseline - (int32_t)MAIN_PULSE_BASELINE_DELTA);
+	band_hi = Clamp_U16_From_I32(baseline + (int32_t)MAIN_PULSE_BASELINE_DELTA);
 
 	features->valid = 0;
 	features->win_start = (anchor_peak_index > MAIN_PULSE_PRE_SAMPLES) ?
@@ -2550,7 +2785,7 @@ static uint8_t Extract_MainPulse_Features(uint16_t *buf, uint16_t len,
 	i = features->peak_index;
 	while (i > features->win_start)
 	{
-		if (buf[i] <= threshold_near_base)
+		if (buf[i] >= band_lo && buf[i] <= band_hi)
 		{
 			if (settle < 255)
 			{
@@ -2576,7 +2811,7 @@ static uint8_t Extract_MainPulse_Features(uint16_t *buf, uint16_t len,
 	settle = 0;
 	for (i = features->peak_index; i <= features->win_end; i++)
 	{
-		if (buf[i] <= threshold_near_base)
+		if (buf[i] >= band_lo && buf[i] <= band_hi)
 		{
 			if (settle < 255)
 			{

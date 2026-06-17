@@ -54,6 +54,12 @@
 #define DEAD_TIME_MAX           200      // 最大死区时间
 
 /* 差值触发配置 */
+/* 差分触发总开关：=0 关闭（快照只由2V模拟看门狗触发），=1 启用斜率触发。
+ * 差分触发按"相邻样本跳变速率"触发、不看绝对幅值，在高干扰/高阈值场景下会被
+ * 低幅噪声疯狂触发（实测10分钟2864次触发里约2850次是它产生的<1V噪声），挤占
+ * 单快照缓冲导致真雨滴被丢、波形刷不全。故默认关闭；需要捕捉未达阈值的快速
+ * 小信号边沿时再设为1。 */
+#define ENABLE_DIFF_TRIGGER         0
 #define DIFF_TRIGGER_THRESHOLD      100   // 差分触发阈值（ADC单位，约80mV），适配小信号检测
 #define DIFF_TRIGGER_CONSEC         2     // 连续满足差分阈值的样本数
 #define DIFF_TRIGGER_COOLDOWN       150   // 触发后冷却样本数，避免重复触发
@@ -553,6 +559,7 @@ static void Evaluate_Diff_Trigger(uint16_t ch0_value, uint16_t idx_ch0)
         trigger_now = 1;
         awd_trigger_pending = 0;
     }
+#if ENABLE_DIFF_TRIGGER
     else if (have_prev_ch0)
     {
         uint16_t diff = (ch0_value > prev_ch0_value) ? (ch0_value - prev_ch0_value) : (prev_ch0_value - ch0_value);
@@ -573,6 +580,7 @@ static void Evaluate_Diff_Trigger(uint16_t ch0_value, uint16_t idx_ch0)
             diff_cooldown_counter = DIFF_TRIGGER_COOLDOWN;
         }
     }
+#endif
 
     prev_ch0_value = ch0_value;
     have_prev_ch0 = 1;

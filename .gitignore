@@ -3,6 +3,11 @@ Objects/
 Listings/
 DebugConfig/
 *.uvguix.*
+*.uvoptx
+
+# Debug / runtime artifacts
+serial_log.txt
+*.log
 
 # Python
 .venv/

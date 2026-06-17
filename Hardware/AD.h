@@ -19,15 +19,20 @@ void AD_Init(void);
 #define ADC_SAMPLE_INTERVAL_US      14.0f
 
 /* 采样与峰值抓取扩展 */
-#define RING_BUFFER_SIZE 500
+/* 环形缓冲≥前窗采样数(快照前段从这里取历史)。前窗429点(6ms)，留余量取600。 */
+#define RING_BUFFER_SIZE 600
 #define ISR_CAPTURE_PRE_US          350U
 #define ISR_CAPTURE_POST_US         1400U
 #define ISR_CAPTURE_PRE_SAMPLES     ((((uint32_t)ISR_CAPTURE_PRE_US * 1000UL) + ADC_SAMPLE_INTERVAL_NS - 1UL) / ADC_SAMPLE_INTERVAL_NS)
 #define ISR_CAPTURE_POST_SAMPLES    ((((uint32_t)ISR_CAPTURE_POST_US * 1000UL) + ADC_SAMPLE_INTERVAL_NS - 1UL) / ADC_SAMPLE_INTERVAL_NS)
 #define ISR_CAPTURE_WINDOW_SIZE     (ISR_CAPTURE_PRE_SAMPLES + 1U + ISR_CAPTURE_POST_SAMPLES)
 #define ISR_CAPTURE_BASELINE_SAMPLES 32U
-#define SNAPSHOT_PRE_SAMPLES 200
-#define SNAPSHOT_POST_SAMPLES 300
+/* 快照窗口：前6ms + 后15ms（14us采样下429+1072点，共1501点≈21ms），全分辨率。
+ * 用于：1) 显示完整雨滴波形（主脉冲+整段振铃，对应示波器低时基那条曲线）；
+ *       2) 积分覆盖完整主脉冲（结束由信号衰减决定，见MAIN_PULSE_*）。
+ * 注意：积分口径已改，需重新标定三针头LUT。 */
+#define SNAPSHOT_PRE_SAMPLES 429
+#define SNAPSHOT_POST_SAMPLES 1072
 #define SNAPSHOT_SIZE (SNAPSHOT_PRE_SAMPLES + SNAPSHOT_POST_SAMPLES)
 
 /* 双通道环形缓冲区（分别为两路信号） */
@@ -51,9 +56,13 @@ extern volatile uint16_t snapshot_trigger_index_ch0; /* 快照触发时的PA0环
 
 extern volatile uint32_t sampling_tick_counter;
 
-/* Keil Array Visualization 可观察数组（用于调试） */
+/* Keil Array Visualization 可观察数组（仅调试用）。
+ * 量产关闭以省1KB RAM并去掉中断里每次TC的500元素拷贝；要在Keil看波形时改为1。 */
+#define ENABLE_ADC_VISUALIZE 0
+#if ENABLE_ADC_VISUALIZE
 extern volatile uint16_t ADC_Visualize_Buffer[500];  // ADC可视化缓冲区（通道0数据）
 extern volatile uint16_t ADC_Visualize_Index;         // 可视化缓冲区写索引
+#endif
 
 extern volatile uint16_t dbg_pair_pa0_last;
 extern volatile uint16_t dbg_pair_pa1_last;

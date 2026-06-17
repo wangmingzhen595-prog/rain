@@ -753,6 +753,36 @@
           </Files>
         </Group>
         <Group>
+          <GroupName>LCD</GroupName>
+          <Files>
+            <File>
+              <FileName>LCD_ILI9341.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Hardware\LCD_ILI9341.c</FilePath>
+            </File>
+            <File>
+              <FileName>LCD_ILI9341.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Hardware\LCD_ILI9341.h</FilePath>
+            </File>
+            <File>
+              <FileName>LCD_Font.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Hardware\LCD_Font.h</FilePath>
+            </File>
+            <File>
+              <FileName>RainDisplay.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Hardware\RainDisplay.c</FilePath>
+            </File>
+            <File>
+              <FileName>RainDisplay.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Hardware\RainDisplay.h</FilePath>
+            </File>
+          </Files>
+        </Group>
+        <Group>
           <GroupName>User</GroupName>
           <Files>
             <File>
